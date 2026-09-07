@@ -585,6 +585,14 @@ class AnthropicServing:
                 continuous_usage_stats=True,
             )
 
+        # Pass through PD disaggregation fields injected by the Rust router.
+        if anthropic_request.bootstrap_host is not None:
+            request_data["bootstrap_host"] = anthropic_request.bootstrap_host
+        if anthropic_request.bootstrap_port is not None:
+            request_data["bootstrap_port"] = anthropic_request.bootstrap_port
+        if anthropic_request.bootstrap_room is not None:
+            request_data["bootstrap_room"] = anthropic_request.bootstrap_room
+
         chat_request = ChatCompletionRequest(**request_data)
 
         if anthropic_request.thinking is not None:

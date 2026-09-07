@@ -563,6 +563,7 @@ class OpenAIServingChat(OpenAIServingBase):
             elif request.reasoning_effort not in (
                 None,
                 "none",
+                "no_think",
                 "low",
                 "high",
                 "max",
@@ -651,6 +652,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return parsed
         _EFFORT_MAP = {
             "none": 0.0,
+            "no_think": 0.0,
             "minimal": 0.1,
             "low": 0.2,
             "medium": 0.7,
@@ -973,7 +975,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs
             else None
         )
-        if self.is_gpt_oss and reasoning_effort == "none":
+        if self.is_gpt_oss and reasoning_effort in ("none", "no_think"):
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
             )
@@ -2301,7 +2303,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if (
             self.reasoning_parser in ["mistral"]
             and request.reasoning_effort is not None
-            and request.reasoning_effort != "none"
+            and request.reasoning_effort not in ("none", "no_think")
         ):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "inkling":
@@ -2442,6 +2444,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 "thinking_mode"
             ) == "enabled"
 
+        if self.reasoning_parser == "glm45":
+            chat_template_kwargs = request.chat_template_kwargs or {}
+            return not (
+                request.reasoning_effort in ("none", "no_think")
+                or chat_template_kwargs.get("enable_thinking") is False
+                or chat_template_kwargs.get("thinking") is False
+            )
+
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
@@ -2464,7 +2474,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if mode == "mistral":
                 return (
                     request.reasoning_effort is not None
-                    and request.reasoning_effort != "none"
+                    and request.reasoning_effort not in ("none", "no_think")
                 )
             if mode in ("thinking", "enable_thinking"):
                 return (
@@ -2489,7 +2499,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if config.special_case == "mistral":
             return (
                 request.reasoning_effort is not None
-                and request.reasoning_effort != "none"
+                and request.reasoning_effort not in ("none", "no_think")
             )
 
         if config.toggle_param is None or config.default_enabled is None:

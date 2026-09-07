@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils.common import require_gathered_buffer
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -400,6 +401,19 @@ def capture_prefill_graph(
         for num_tokens in prefill_config.bs
         if num_tokens <= max_capture_tokens
     )
+    # The MAX_LEN DP gather (all_gather_into_tensor over the attn-TP split)
+    # requires the per-rank token count to divide evenly across the
+    # attention-TP group; buckets that would fail the collective fall back
+    # to eager (mirrors the decode runner's alignment filter in
+    # get_batch_sizes_to_capture).
+    if require_gathered_buffer():
+        attn_tp_size = get_parallel().attn_tp_size
+        if attn_tp_size > 1:
+            capture_num_tokens = [
+                num_tokens
+                for num_tokens in capture_num_tokens
+                if num_tokens % attn_tp_size == 0
+            ]
     # Resolve the context- and request-capacity-bounded buckets once before
     # constructing the runner so every backend consumes the same config.
     prefill_config.bs = capture_num_tokens

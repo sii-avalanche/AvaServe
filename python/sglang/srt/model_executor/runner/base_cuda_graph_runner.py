@@ -61,6 +61,22 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
+def forward_is_dp_local_draft(model_runner: ModelRunner) -> bool:
+    """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
+    DP rank drafts independently with no cross-DP collective, so its
+    hand-built batches carry no dp-global metadata and must key graphs by
+    local batch size. Everything else keeps the dp-global padding path."""
+    if not model_runner.is_draft_worker:
+        return False
+    if not model_runner.spec_algorithm.is_dspark():
+        return False
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        draft_is_deepseek_v4,
+    )
+
+    return not draft_is_deepseek_v4()
+
+
 def get_batch_sizes_to_capture(
     model_runner: ModelRunner, captured_req_width: int = 1
 ) -> Tuple[List[int], List[int]]:
@@ -74,6 +90,10 @@ def get_batch_sizes_to_capture(
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = get_cuda_graph_batch_size_alignment()
+    if forward_is_dp_local_draft(model_runner):
+        # The dp-local draft uses no gathered buffer; its graph buckets
+        # need no attention-tp alignment.
+        mul_base = 1
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width

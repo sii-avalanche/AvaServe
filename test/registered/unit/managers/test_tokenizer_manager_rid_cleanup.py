@@ -613,6 +613,96 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertFalse(tm.rid_to_state)
 
 
+class TestAbortDispatchedReqStates(CustomTestCase):
+    """Direct tests for _abort_dispatched_req_states."""
+
+    def test_aborts_only_dispatched(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        for r, dispatched in [("a", True), ("b", False), ("c", True)]:
+            st = _make_req_state(r)
+            st.dispatched = dispatched
+            tm.rid_to_state[r] = st
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = ["a", "b", "c", "missing"]
+        tm._abort_dispatched_req_states(obj)
+        self.assertEqual(
+            [c.args[0] for c in tm.abort_request.call_args_list], ["a", "c"]
+        )
+        # The abort helper itself must not drop the states.
+        self.assertIn("a", tm.rid_to_state)
+        self.assertIn("b", tm.rid_to_state)
+
+    def test_abort_failure_does_not_propagate(self):
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock(side_effect=RuntimeError("zmq closed"))
+        st = _make_req_state("x")
+        st.dispatched = True
+        tm.rid_to_state["x"] = st
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = "x"
+        tm._abort_dispatched_req_states(obj)  # must not raise
+
+
+class TestGenerateRequestAbortsOnConsumerDeath(CustomTestCase):
+    """generate_request aborts dispatched requests when the consumer dies.
+
+    Regression guard: after dispatch, dropping rid_to_state without aborting
+    leaves the scheduler running a zombie request that keeps sending outputs
+    for a deleted rid ("Received output ... but the state was deleted in
+    TokenizerManager") until it finishes on its own.
+    """
+
+    def test_cancel_after_dispatch_aborts_and_discards(self):
+        tm = _make_tm_for_generate(self)
+        rid = "dispatched_then_cancelled"
+        obj = _make_generate_obj(rid, is_single=True)
+        tok = Mock()
+        tok.rid = rid
+        tok.input_ids = [1]
+        tm._tokenize_one_request = AsyncMock(return_value=tok)
+
+        def _send(tok_obj):
+            tm.rid_to_state[tok_obj.rid].dispatched = True
+
+        tm._send_one_request = Mock(side_effect=_send)
+        tm.abort_request = Mock()
+
+        async def fake_wait(o, r):
+            yield {"text": "hi", "meta_info": {"id": rid}}
+
+        tm._wait_one_response = fake_wait
+
+        async def drive():
+            agen = tm.generate_request(obj)
+            first = await agen.__anext__()
+            self.assertEqual(first["text"], "hi")
+            # Simulate the consumer task being cancelled mid-stream.
+            with self.assertRaises(asyncio.CancelledError):
+                await agen.athrow(asyncio.CancelledError)
+
+        asyncio.run(drive())
+        tm.abort_request.assert_called_once_with(rid)
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_failure_before_dispatch_skips_abort(self):
+        tm = _make_tm_for_generate(self)
+        rid = "never_dispatched"
+        obj = _make_generate_obj(rid, is_single=True)
+        tm._tokenize_one_request = AsyncMock(side_effect=ValueError("input too long"))
+        tm.abort_request = Mock()
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(ValueError):
+            asyncio.run(drive())
+        tm.abort_request.assert_not_called()
+        self.assertNotIn(rid, tm.rid_to_state)
+
+
 class TestWaitOneResponseAfterStateFreed(CustomTestCase):
     """A waiter built before its request finishes must still deliver the output.
 

@@ -430,12 +430,36 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
-        if dp_rank == 0:
-            local_start_pos = torch.zeros_like(cumtokens[0])
+        if (
+            forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+            and forward_batch.global_dp_buffer_len is not None
+        ):
+            # MAX_LEN padding lays the gathered buffer out with an equal,
+            # padded per-DP region (the cuda-graph capture shape, resp. the
+            # eagerly padded batch). Slice by that padded geometry:
+            # global_num_tokens_gpu holds the REAL per-rank counts at graph
+            # replay (mask_dp_pad_moe_topk_ids needs those), and slicing by
+            # them hands another DP rank's pad rows (garbage, possibly NaN)
+            # to this rank's consumers whenever the real counts are uneven
+            # (e.g. one DP idle).
+            dp_size = get_attention_dp_size()
+            num_local = forward_batch.global_dp_buffer_len // dp_size
+            # full_like (fill kernel) instead of torch.tensor: an H2D copy is
+            # illegal during CUDA graph capture.
+            local_start_pos = torch.full_like(
+                forward_batch.global_num_tokens_gpu[0], dp_rank * num_local
+            )
+            local_num_tokens = torch.full_like(
+                forward_batch.global_num_tokens_gpu[0], num_local
+            )
         else:
-            local_start_pos = cumtokens[dp_rank - 1]
-        local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
+            cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
+            if dp_rank == 0:
+                local_start_pos = torch.zeros_like(cumtokens[0])
+            else:
+                local_start_pos = cumtokens[dp_rank - 1]
+            local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
 
         forward_batch.dp_local_start_pos = local_start_pos
         forward_batch.dp_local_num_tokens = local_num_tokens
@@ -558,13 +582,17 @@ def _dp_gather_via_all_gather(
             get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
-    if not is_partial:
-        if get_attn_tensor_model_parallel_rank() != 0:
-            local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(
-        get_attn_tensor_model_parallel_world_size()
-    )[get_attn_tensor_model_parallel_rank()]
-    get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if is_partial:
+        scattered_local_tokens = local_tokens.tensor_split(
+            get_attn_tensor_model_parallel_world_size()
+        )[get_attn_tensor_model_parallel_rank()]
+        get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    else:
+        # Replicated input: every rank holds identical data, so its shard is a
+        # free local slice -- a reduce-scatter would produce the same bytes.
+        scattered_local_tokens = local_tokens.tensor_split(
+            get_attn_tensor_model_parallel_world_size()
+        )[get_attn_tensor_model_parallel_rank()]
     if use_world:
         torch.distributed.all_gather_into_tensor(
             global_tokens,

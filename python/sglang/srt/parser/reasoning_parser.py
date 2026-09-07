@@ -123,7 +123,11 @@ class BaseReasoningFormatDetector:
         )
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
-        in_reasoning = self._in_reasoning or self.think_start_token in text
+        in_reasoning = (
+            self._in_reasoning
+            or self.think_start_token in text
+            or self.think_end_token in text
+        )
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)

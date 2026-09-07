@@ -72,6 +72,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
+        prometheus_handle: None,
     });
 
     c.bench_function("wasm_middleware_pre_fix_latency", |b| {

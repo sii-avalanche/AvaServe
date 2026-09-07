@@ -488,6 +488,23 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
 
+    def test_filter_releases_finished_request_before_removal(self):
+        scheduler = self._new_scheduler()
+        scheduler.batch_result_processor = MagicMock()
+        req = MagicMock()
+        req.finished.return_value = True
+        req.kv.holds_kv = True
+        req.kv.is_kv_released = False
+        batch = MagicMock()
+        batch.reqs = [req]
+
+        scheduler._filter_batch_after_finished_req_release(batch)
+
+        scheduler.batch_result_processor._release_finished_req_resources.assert_called_once_with(
+            req
+        )
+        batch.filter_batch.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

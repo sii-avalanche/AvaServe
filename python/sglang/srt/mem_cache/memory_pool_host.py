@@ -165,7 +165,8 @@ class LogicalHostPool:
         pass
 
     def get_page_buffer_meta(self, indices):
-        return None
+        page_count = indices.numel() // self.page_size
+        return [0] * page_count, [0] * page_count
 
     def get_ksize_per_token(self):
         return 0

@@ -374,6 +374,10 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    # PD disaggregation fields injected by the Rust router.
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
     # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None

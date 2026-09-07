@@ -23,6 +23,7 @@ use crate::{
     config::RoutingMode,
     core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
     protocols::{
+        anthropic::AnthropicMessagesRequest,
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
@@ -701,6 +702,28 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router.route_classify(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_anthropic_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &AnthropicMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let selected_model = model_id.or(Some(&body.model));
+        let router = self.select_router_for_request(headers, selected_model);
+
+        if let Some(router) = router {
+            router
+                .route_anthropic_messages(headers, body, selected_model)
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,

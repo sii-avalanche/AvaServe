@@ -1,7 +1,6 @@
 import dataclasses
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -20,33 +19,6 @@ if TYPE_CHECKING:
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
-
-
-class RecentPrefillBatchSizeTracker:
-    """Track the largest of the latest non-empty prefill attempts.
-
-    The default window keeps 16 attempts. Successful admissions use their
-    actual batch size; rejected attempts use a conservative local estimate.
-    Decode-only and idle scheduler passes do not age the high-watermark.
-    """
-
-    def __init__(self, window_size: int = 16):
-        if window_size <= 0:
-            raise ValueError(f"window_size must be positive, got {window_size}")
-        self._recent_attempt_sizes = deque(maxlen=window_size)
-
-    @property
-    def max_prefill_bs(self) -> int:
-        return max(self._recent_attempt_sizes, default=0)
-
-    def observe_attempt(self, attempted_prefill_bs: int) -> int:
-        if attempted_prefill_bs <= 0:
-            raise ValueError(
-                "attempted_prefill_bs must be positive for a non-empty attempt, "
-                f"got {attempted_prefill_bs}"
-            )
-        self._recent_attempt_sizes.append(attempted_prefill_bs)
-        return self.max_prefill_bs
 
 
 @dataclass(frozen=True)
@@ -271,9 +243,18 @@ class PrefillDelayer:
                     if elapsed_ms >= self._max_delay_ms:
                         queue_condition = False
 
+            # max_prefill_bs is a historical high-water mark and never
+            # decreases. Use it only as a cap for the current demand;
+            # otherwise one old large prefill batch can make the delayer wait
+            # for that many free request slots even when only a few requests
+            # are currently waiting.
+            required_prefill_slots = min(
+                global_waiting_queue_max,
+                global_max_prefill_bs_max,
+            )
             slot_condition = (
                 max_running_requests - global_running_batch_max
-                < global_max_prefill_bs_max
+                < required_prefill_slots
             )
 
             if slot_condition or queue_condition:
@@ -384,45 +365,21 @@ class PrefillDelayerSinglePassExecutor:
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
         self._result: Optional[_NegotiateOutput] = None
-        self._attempted_prefill_bs = 0
 
     @property
     def _called(self) -> bool:
         return self._result is not None
 
-    def finalize(self, *, actual_prefill_bs: int) -> int:
+    def finalize(self, *, actual_prefill: bool):
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
         _record_single_pass_result(
-            actual_execution=actual_prefill_bs > 0,
+            actual_execution=actual_prefill,
             output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
             debug_log_enabled=self._prefill_delayer._debug_log_enabled,
         )
-        return actual_prefill_bs or self._attempted_prefill_bs
-
-    def _estimate_attempted_prefill_bs(
-        self,
-        *,
-        running_batch: int,
-        max_running_requests: int,
-        waiting_queue_len: int,
-    ) -> int:
-        local_max_running_requests = max_running_requests
-        if not self._prefill_delayer.enable_dp_attention:
-            local_max_running_requests = (
-                max_running_requests + self._prefill_delayer.dp_size - 1
-            ) // self._prefill_delayer.dp_size
-
-        # The delayer negotiates before PrefillAdder materializes can_run_list,
-        # so a rejected pass has no exact batch size. This upper bound is exact
-        # when the waiting queue is the limiter (for example, two queued
-        # requests after a cached BS=10 spike), and it never exceeds the local
-        # request slots available to the candidate batch.
-        free_slots = max(local_max_running_requests - running_batch, 1)
-        non_empty_queue_len = max(waiting_queue_len, 1)
-        return min(non_empty_queue_len, free_slots)
 
     def negotiate_should_allow_prefill(
         self,
@@ -432,15 +389,6 @@ class PrefillDelayerSinglePassExecutor:
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
     ) -> bool:
-        if local_prefillable:
-            self._attempted_prefill_bs = max(
-                self._attempted_prefill_bs,
-                self._estimate_attempted_prefill_bs(
-                    running_batch=running_batch,
-                    max_running_requests=max_running_requests,
-                    waiting_queue_len=waiting_queue_len,
-                ),
-            )
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,

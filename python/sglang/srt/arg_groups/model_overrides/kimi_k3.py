@@ -101,9 +101,33 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "flashinfer":
+            # The Hopper-viable DCP path: SM90 has no trtllm-gen/cute-dsl MLA
+            # cubin, so decode stays on flashinfer's fa3 MLA kernel (for MLA
+            # models the "flashinfer" backend is FlashInferMLAAttnBackend).
+            # Prefill must follow it: the platform default (fa3) never reads
+            # attn_dcp_metadata, while the FlashInfer-MLA prefill updater
+            # swaps in the gathered dcp_kv_buffer via dcp_kv_indptr/indices.
+            if cfg.speculative_algorithm is not None:
+                raise ValueError(
+                    "Kimi-K3 DCP with decode_attention_backend='flashinfer' "
+                    "does not support speculative decoding: the target-verify "
+                    "metadata path does not shard the KV table across DCP "
+                    "ranks. Use cutedsl_mla/tokenspeed_mla (SM100+) for a DCP "
+                    "speculative run, or drop --speculative-algorithm."
+                )
+            logger.info(
+                "Kimi-K3 DCP overrides attention backends: "
+                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
+                "'flashinfer'."
+            )
+            overrides.update(
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="flashinfer",
+            )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'flashinfer', got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None:

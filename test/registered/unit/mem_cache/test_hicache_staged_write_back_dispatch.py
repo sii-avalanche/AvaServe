@@ -911,6 +911,27 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         self.assertIsNone(group.destroy())
 
+    def test_logical_host_pool_returns_page_buffer_metadata(self):
+        logical_host_pool = LogicalHostPool(8, 2)
+
+        offsets, lengths = logical_host_pool.get_page_buffer_meta(_indices(0, 6))
+
+        self.assertEqual(offsets, [0, 0, 0])
+        self.assertEqual(lengths, [0, 0, 0])
+
+    def test_logical_anchor_requires_sidecar_transfers(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = LogicalHostPool(8, 2)
+
+        with self.assertRaisesRegex(RuntimeError, "requires sidecar pool transfers"):
+            controller._check_logical_anchor_has_sidecars(
+                SimpleNamespace(pool_transfers=[])
+            )
+
+        controller._check_logical_anchor_has_sidecars(
+            SimpleNamespace(pool_transfers=[object()])
+        )
+
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = []
 

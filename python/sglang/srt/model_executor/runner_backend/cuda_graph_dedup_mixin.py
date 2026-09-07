@@ -37,6 +37,17 @@ def dedup_update(graph_exec: int, raw_graph: int) -> tuple[bool, str]:
     return ok, "" if ok else f"err={int(err)} result={result}"
 
 
+def _upload_graph_exec(graph_exec: int, stream: int) -> None:
+    """Best-effort cudaGraphUpload: pre-stage the executable on the device so
+    steady-state launches skip the driver's lazy upload/validation work.
+    Launch semantics are unchanged if the upload fails (the driver then
+    uploads lazily inside cudaGraphLaunch)."""
+    try:
+        checkCudaErrors(cuda_rt.cudaGraphUpload(graph_exec, stream))
+    except Exception as e:  # e.g. a driver without graph-upload support
+        logger.warning("cudaGraphUpload failed; launches will upload lazily: %s", e)
+
+
 def maybe_cuda_result(result):
     return None if int(result[0]) != 0 else checkCudaErrors(result)
 
@@ -210,6 +221,7 @@ class DedupedCudaGraphRegistry:
         graph_exec = checkCudaErrors(
             cuda_rt.cudaGraphInstantiateWithFlags(raw_graph, 0)
         )
+        _upload_graph_exec(graph_exec, torch.cuda.current_stream().cuda_stream)
         return graph_exec
 
     def destroy_exec(self, graph_exec: int) -> None:
@@ -271,6 +283,8 @@ class DedupedCudaGraphRegistry:
                 f"({detail}); captured graph is not compatible with its dedup group"
             )
             group.current_raw_graph = raw_graph
+            # cudaGraphExecUpdate invalidates the device-side upload.
+            _upload_graph_exec(graph_exec, stream)
 
         checkCudaErrors(cuda_rt.cudaGraphLaunch(graph_exec, stream))
 

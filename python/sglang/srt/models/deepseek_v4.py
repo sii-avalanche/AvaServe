@@ -301,7 +301,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
-_SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -2280,19 +2279,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
         mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
-        # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
-        # on LOCAL hidden before the gather and add it back after the combine
-        # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
-        # Applies to BOTH prefill and decode: the shared expert is a per-token MLP,
-        # so computing it on this rank's local tokens (M_local rows) is identical to
-        # computing it on the gathered global buffer (M_global rows) and keeping the
-        # local slice -- but costs 1/dp_size the rows. With a replicated (TP1) shared
-        # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
-        # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
+        # A replicated (TP1) shared expert must NEVER pass through the combine's
+        # sum: every rank computes the identical full output, so a reduce would
+        # count it once per TP rank. Compute it on LOCAL hidden before the gather
+        # (skipped inside the global MoE via skip_shared_experts) and add it back
+        # after the combine (reduce_scatterv OR dp_scatter). The shared expert is
+        # a per-token MLP, so computing it on this rank's local tokens (M_local
+        # rows) is identical to computing it on the gathered global buffer
+        # (M_global rows) and keeping the local slice -- but costs 1/dp_size the
+        # rows, which also cancels the TP1 "full-dim" cost in decode.
         _shared_local = None
         _do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and _use_tp_moe_gather
+            _use_tp_moe_gather
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
@@ -2560,8 +2558,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # back after the combine (same as the non-fused forward). Skipped in the
         # global MoE via skip_shared_experts.
         do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and getattr(self.mlp, "shared_experts", None) is not None
+            getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
         state.do_shared_local = do_shared_local

@@ -197,7 +197,6 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
-    RecentPrefillBatchSizeTracker,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -1296,10 +1295,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
-            window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
-        )
-        self.max_prefill_bs: int = 0
+        self.max_prefill_bs: float = 0.0
         if get_schedule().enable_prefill_delayer:
             if get_disagg().disaggregation_mode == "decode":
                 logger.info(
@@ -3399,7 +3395,10 @@ class Scheduler(
 
             # Filter batch
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            self._filter_batch_after_finished_req_release(
+                last_batch,
+                chunked_req_to_exclude=list(chunked_req_to_exclude),
+            )
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
@@ -3417,7 +3416,7 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if running_batch.is_prefill_only:
-            running_batch.filter_batch()
+            self._filter_batch_after_finished_req_release(running_batch)
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
@@ -3504,6 +3503,11 @@ class Scheduler(
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
+            # Decay the max-prefill-bs high-watermark once per pass so one
+            # unusually large admission burst does not permanently raise the
+            # slot_condition bar in the delayer (0.998/pass ~= half-life of
+            # ~350 forward passes).
+            self.max_prefill_bs *= 0.998
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -3518,13 +3522,9 @@ class Scheduler(
         )
 
         if self.prefill_delayer:
-            observed_prefill_bs = prefill_delayer_single_pass.finalize(
-                actual_prefill_bs=ret.batch_size() if ret is not None else 0
+            prefill_delayer_single_pass.finalize(
+                actual_prefill=ret is not None and ret.batch_size() > 0
             )
-            if observed_prefill_bs > 0:
-                self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(
-                    observed_prefill_bs
-                )
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -3777,6 +3777,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
+        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -3814,7 +3815,7 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
+            self._filter_batch_after_finished_req_release(running_batch)
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
@@ -3866,11 +3867,24 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _filter_batch_after_finished_req_release(
+        self, batch: ScheduleBatch, **kwargs
+    ) -> None:
+        for req in batch.reqs:
+            if (
+                not req.finished()
+                or not req.kv.holds_kv
+                or req.kv.is_kv_released
+            ):
+                continue
+            self.batch_result_processor._release_finished_req_resources(req)
+        batch.filter_batch(**kwargs)
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        self._filter_batch_after_finished_req_release(batch)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch

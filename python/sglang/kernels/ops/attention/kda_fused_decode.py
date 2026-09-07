@@ -17,6 +17,10 @@ The JIT currently instantiates local head counts H = HV in {12, 6, 3}
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
 Everything else falls back to the unfused chain.
+
+Recurrent-state pools may be fp32 (dense default) or bf16
+(--mamba-ssm-dtype bfloat16): the kernel widens bf16 to fp32 on load and
+rounds back on store, matching the unfused chain's numerics.
 """
 
 from __future__ import annotations
@@ -89,7 +93,9 @@ def covered(
         and b.dtype == torch.bfloat16
         and onorm_g.dtype == torch.bfloat16
         and conv_states.dtype == torch.bfloat16
-        and ssm_states.dtype == torch.float32
+        # fp32 pool (dense default) or bf16 pool (--mamba-ssm-dtype bfloat16):
+        # the kernel widens bf16 to fp32 on load and rounds back on store.
+        and ssm_states.dtype in (torch.float32, torch.bfloat16)
         and cache_indices.dtype == torch.int32
         and mixed_qkv.stride(-1) == 1
         and a.stride(-1) == 1
@@ -105,6 +111,10 @@ def covered(
         and ssm_states.stride(-1) == 1
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
+        # Vectorized state accesses (16B fp32 cp.async / 8B bf16 uint2) need
+        # the slot pitch to be a multiple of 4 elements so every slot's base
+        # stays aligned; the K3 dense and envelope pitches both satisfy this.
+        and ssm_states.stride(-4) % 4 == 0
         and cache_indices.is_contiguous()
     )
 

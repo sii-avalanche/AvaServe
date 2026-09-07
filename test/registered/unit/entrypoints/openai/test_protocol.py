@@ -30,6 +30,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    ResponseFunctionToolChoice,
+    ResponsesRequest,
     Tool,
     UsageInfo,
 )
@@ -284,6 +286,18 @@ class TestChatCompletionRequest(unittest.TestCase):
             reasoning_effort="none",
         )
         self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_no_think(self):
+        """Test reasoning_effort='no_think' disables thinking."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="no_think",
+        )
+        self.assertEqual(request.reasoning_effort, "no_think")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
@@ -773,6 +787,31 @@ class TestValidationEdgeCases(unittest.TestCase):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+
+
+class TestResponsesRequest(unittest.TestCase):
+    def test_named_function_tool_choice_uses_responses_schema(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="Run the command",
+            tool_choice={"type": "function", "name": "shell"},
+            tools=[{"type": "function", "name": "shell"}],
+        )
+
+        self.assertIsInstance(request.tool_choice, ResponseFunctionToolChoice)
+        chat_choice = request.tool_choice.to_chat_tool_choice()
+        self.assertEqual(chat_choice.type, "function")
+        self.assertEqual(chat_choice.function.name, "shell")
+
+    def test_default_max_output_tokens_is_capped(self):
+        request = ResponsesRequest(model="test-model", input="hi")
+
+        sampling_params = request.to_sampling_params(
+            default_max_tokens=1_000_000,
+            default_params={},
+        )
+
+        self.assertEqual(sampling_params["max_new_tokens"], 65534)
 
 
 class TestParsedResponseFieldsProtocol(unittest.TestCase):

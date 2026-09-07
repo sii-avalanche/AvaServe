@@ -423,6 +423,13 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
 
+    def test_detect_and_parse_reasoning_without_start_token(self):
+        """Parse output when the prompt already opened the reasoning block."""
+        text = "Let me think about this step by step</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this step by step")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
     def test_streaming_no_stream_reasoning(self):
         """Test streaming without stream_reasoning enabled."""
         detector = Glm45Detector(stream_reasoning=False)

@@ -18,7 +18,10 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     divide,
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
     get_pp_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
@@ -42,7 +45,9 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
+    get_dp_local_info,
     get_global_dp_buffer,
+    get_global_dp_buffer_len,
     get_local_dp_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -128,6 +133,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
     get_bool_env_var,
+    get_device_sm,
     rank0_log,
     require_mlp_sync,
     set_weight_attrs,
@@ -257,6 +263,147 @@ def _dp_local_buffer_group():
     if parallel.tp_size == parallel.attn_dp_size:
         return get_tp_group()
     return parallel.attn_tp_group
+
+
+def _dp_gather_moe_inputs(
+    global_latent: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    global_topk_weights: torch.Tensor,
+    latent_shard: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Assemble the MoE inputs with ONE collective per layer.
+
+    Rank (dp g, attn j) packs [latent column block | top-k id shard | top-k
+    weight shard] into a single flat byte payload; one all-gather (decode /
+    CUDA graph, padded fixed geometry) or one zero-padded all-reduce SUM
+    (prefill / eager variable length) assembles everything. This replaces the
+    former three per-layer collectives (one latent block gather + two top-k
+    row gathers): the top-k payloads are a few KB each, so the fixed ring
+    latency of the 32-rank/4-node collective dominated their cost.
+
+    The latent blocks are the transpose of the hidden DP gather they replace
+    (identical per-rank payload: rows/attn_tp x moe_hidden == rows x
+    moe_hidden/attn_tp); the assembled rows stay dp-major so dp_scatter and
+    the global-token bookkeeping are unchanged.
+    """
+    parallel = get_parallel()
+    attn_world = parallel.attn_tp_size
+    attn_rank = parallel.attn_tp_rank
+    tp_world = parallel.tp_size
+    num_rows, col = latent_shard.shape
+    k = topk_ids.shape[1]
+
+    id_shards = topk_ids.tensor_split(attn_world)
+    wt_shards = topk_weights.tensor_split(attn_world)
+    ids_shard = id_shards[attn_rank].contiguous()
+    wt_shard = wt_shards[attn_rank].contiguous()
+    shard_rows = ids_shard.shape[0]
+
+    lat_bytes = num_rows * col * global_latent.element_size()
+    ids_bytes = shard_rows * k * topk_ids.element_size()
+    wt_bytes = shard_rows * k * topk_weights.element_size()
+
+    if (
+        forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+    ):
+        payload = torch.cat(
+            [
+                latent_shard.reshape(-1).view(torch.uint8),
+                ids_shard.view(torch.uint8).reshape(-1),
+                wt_shard.view(torch.uint8).reshape(-1),
+            ]
+        )
+        gathered = payload.new_empty(payload.numel() * tp_world)
+        get_tp_group().all_gather_into_tensor(gathered, payload)
+        packed = gathered.view(tp_world, -1)
+
+        lat = (
+            packed[:, :lat_bytes]
+            .contiguous()
+            .view(global_latent.dtype)
+            .view(tp_world, num_rows, col)
+        )
+        global_latent.view(-1, attn_world, col).view(
+            -1, num_rows, attn_world, col
+        ).copy_(lat.view(-1, attn_world, num_rows, col).permute(0, 2, 1, 3))
+
+        off = lat_bytes
+        global_topk_ids.copy_(
+            packed[:, off : off + ids_bytes]
+            .contiguous()
+            .view(topk_ids.dtype)
+            .view(tp_world * shard_rows, k)
+        )
+        off += ids_bytes
+        global_topk_weights.copy_(
+            packed[:, off : off + wt_bytes]
+            .contiguous()
+            .view(topk_weights.dtype)
+            .view(tp_world * shard_rows, k)
+        )
+    else:
+        # Zero-pad every block into its disjoint slot of one packed global
+        # buffer and let the all-reduce SUM assemble it (each (row, column)
+        # cell is written by exactly one rank, so SUM == concatenation).
+        # NOTE: dtype choice does not matter here — the duration of this
+        # collective is dominated by dp-engine chunk-imbalance waiting, not
+        # by transfer volume (measured on traces: uint8 vs bf16 identical).
+        global_rows = global_latent.shape[0]
+        lat_g = global_rows * attn_world * col * global_latent.element_size()
+        ids_g = global_rows * k * topk_ids.element_size()
+        wt_g = global_rows * k * topk_weights.element_size()
+        buf = global_latent.new_zeros(lat_g + ids_g + wt_g, dtype=torch.uint8)
+        local_start_pos, _ = get_dp_local_info(forward_batch)
+
+        lat_v = buf[:lat_g].view(global_latent.dtype).view(
+            global_rows, attn_world * col
+        )
+        if num_rows > 0:
+            lat_v[
+                local_start_pos : local_start_pos + num_rows,
+                attn_rank * col : (attn_rank + 1) * col,
+            ] = latent_shard
+        shard_start = local_start_pos + sum(
+            s.shape[0] for s in id_shards[:attn_rank]
+        )
+        ids_v = buf[lat_g : lat_g + ids_g].view(topk_ids.dtype).view(global_rows, k)
+        wt_v = buf[lat_g + ids_g :].view(topk_weights.dtype).view(global_rows, k)
+        if shard_rows > 0:
+            ids_v[shard_start : shard_start + shard_rows] = ids_shard
+            wt_v[shard_start : shard_start + shard_rows] = wt_shard
+
+        buf = tensor_model_parallel_all_reduce(buf)
+        global_latent.copy_(
+            buf[:lat_g].view(global_latent.dtype).view(global_rows, attn_world * col)
+        )
+        global_topk_ids.copy_(
+            buf[lat_g : lat_g + ids_g].view(topk_ids.dtype).view(global_rows, k)
+        )
+        global_topk_weights.copy_(
+            buf[lat_g + ids_g :].view(topk_weights.dtype).view(global_rows, k)
+        )
+
+
+def _gather_latent_columns(routed_input: torch.Tensor) -> torch.Tensor:
+    """Restore the full-width latent from attention-TP column shards via one
+    column all-gather (the transpose of a row all-gather: same payload)."""
+    attn_group = get_parallel().attn_tp_group
+    # all_gather_into_tensor requires a contiguous input; routed_input is a
+    # non-contiguous split view of the fused front GEMM output.
+    routed_input = routed_input.contiguous()
+    gathered = routed_input.new_empty(
+        (attn_group.world_size * routed_input.shape[0], routed_input.shape[1])
+    )
+    attn_group.all_gather_into_tensor(gathered, routed_input)
+    return (
+        gathered.view(attn_group.world_size, *routed_input.shape)
+        .permute(1, 0, 2)
+        .reshape(routed_input.shape[0], -1)
+    )
 
 
 def _sp_all_gather_rows(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -550,12 +697,13 @@ class KimiK3MoE(nn.Module):
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
-        # never materializes. Only the situ packed-routing trtllm-gen path
-        # serves the deferral; sizes beyond the push window fall back to the
-        # in-op finalize at runtime (finalize_push_fits).
+        # never materializes. Only the situ packed-routing trtllm-gen (SM100)
+        # path serves the deferral; sizes beyond the push window fall back to
+        # the in-op finalize at runtime (finalize_push_fits).
         self._defer_moe_finalize = (
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
+            and getattr(self.experts.quant_method, "_fi_kernel", None) == "trtllm_sm100"
         )
 
         # Shared experts (operate in original hidden_size space).
@@ -575,6 +723,21 @@ class KimiK3MoE(nn.Module):
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
+        # True when the attention-TP group is a strict (node-local) subgroup
+        # of the TP group (dp attention): the shared-expert partial sums then
+        # reduce over the subgroup only. When it coincides with the TP group
+        # (dp1), the shared reduction is over the full TP group and stays
+        # fused / packed with the latent reduction.
+        self._attn_tp_is_subgroup = (
+            get_attn_tensor_model_parallel_world_size() < self.tp_size
+        )
+        # Platform split for the MoE sharding scheme: Blackwell keeps the
+        # original layout (shared experts sharded over the full TP group,
+        # replicated up projection) that the k3_ar_fusion kernels were
+        # designed around; Hopper shards the shared experts and the up
+        # projection over the node-local attention-TP group, with one
+        # node-local tail reduction.
+        self._is_blackwell = get_device_sm() in (100, 103)
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
@@ -582,6 +745,15 @@ class KimiK3MoE(nn.Module):
             shared_experts_tp_kwargs = dict(
                 tp_rank=get_parallel().attn_tp_rank,
                 tp_size=get_parallel().attn_tp_size,
+            )
+        elif not self._is_blackwell:
+            # Shard over the node-local attention-TP group instead of the
+            # full MoE TP group (Hopper): after the dp-attention all-gather
+            # every rank in an attention-TP group holds the same tokens, so
+            # the shared partial sums only need a node-local reduction.
+            shared_experts_tp_kwargs = dict(
+                tp_rank=get_attn_tensor_model_parallel_rank(),
+                tp_size=get_attn_tensor_model_parallel_world_size(),
             )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -629,25 +801,82 @@ class KimiK3MoE(nn.Module):
                 )
                 else None
             )
-            self.routed_expert_down_proj = ReplicatedLinear(
-                hidden_size,
-                self.moe_hidden_size,
-                bias=False,
-                quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_down_proj",
+            # One switch for sharding both latent projections (down and up)
+            # over the attention-TP group (= the full TP group without dp
+            # attention): Hopper + plain-TP experts only. Under EP a2a the
+            # shared experts are tp1-replicated and there is no shared
+            # reduction to ride; Blackwell keeps the replicated layout the
+            # k3_ar_fusion kernels were designed around; the NPU
+            # attn-tp-comm mode and quantized latent projections keep their
+            # own layouts.
+            #
+            # down_proj (column-sharded): with DP attention the fused front
+            # runs on the DP-LOCAL batch before the gather (see
+            # _forward_hopper_dp) and the dispatch all-gather carries
+            # [local, moe_hidden/attn_tp] column blocks instead of hidden
+            # rows — same payload, no replicated compute. Without DP
+            # attention the full-width latent is restored by one extra
+            # attention-TP column all-gather per layer — a small
+            # communication cost traded for ~6GB/rank less front weight
+            # (86MB -> 20MB per layer) and 32x less down-proj compute.
+            self._latent_proj_sharded = (
+                not self._shared_experts_tp1
+                and not self._shared_experts_attn_tp_comm
+                and not self._is_blackwell
+                and latent_quant_config is None
             )
+            if self._latent_proj_sharded:
+                self.routed_expert_down_proj = ColumnParallelLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    tp_rank=get_attn_tensor_model_parallel_rank(),
+                    tp_size=get_attn_tensor_model_parallel_world_size(),
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
+            else:
+                self.routed_expert_down_proj = ReplicatedLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    bias=False,
+                    quant_config=latent_quant_config,
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_up_proj",
-            )
+            # Row-shard the up projection over the attention-TP group — the
+            # same group the shared experts are sharded across and reduce
+            # over: each rank holds a [moe_hidden/N, hidden] slice, and its
+            # partial sums are added to the shared experts' before one common
+            # all-reduce (all-reduce is linear), so the tail still costs a
+            # single collective. Under EP a2a the shared experts are
+            # tp1-replicated and there is no shared reduction to ride, so the
+            # up projection stays replicated. (Hopper-only row sharding;
+            # Blackwell keeps the replicated up projection.)
+            if self._latent_proj_sharded:
+                self.routed_expert_up_proj = RowParallelLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                    input_is_parallel=False,
+                    reduce_results=False,
+                    tp_rank=get_attn_tensor_model_parallel_rank(),
+                    tp_size=get_attn_tensor_model_parallel_world_size(),
+                )
+            else:
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=latent_quant_config,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -671,6 +900,7 @@ class KimiK3MoE(nn.Module):
         # decode sizes, 1/8 of the weight bytes read per rank). Kernel dims
         # are fixed to fuse_ar_norm's (3584 -> 7168) over TP8; per-batch
         # capacity checks live in k3_ar_fusion.gemm_ag_up_fits.
+        # (Blackwell path only.)
         self._gemm_ag_up_eligible = (
             self.fuse_ar_norm
             and self.tp_size == 8
@@ -1013,6 +1243,18 @@ class KimiK3MoE(nn.Module):
         attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
         return shared_output
 
+    def _reduce_tail(self, shared_output: torch.Tensor) -> torch.Tensor:
+        """All-reduce the combined [shared experts + up projection] partial
+        sums over the group the shared experts are sharded across (the
+        attention-TP group, which is the full TP group without dp attention)."""
+        if self._attn_tp_is_subgroup:
+            return attention_tensor_model_parallel_all_reduce(shared_output)
+        if k3_ar_fusion.enabled():
+            # shared_output is a MOE_LATENT_SHARED symm-buffer slice, which
+            # the fused pull resolves by offset.
+            return k3_ar_fusion.all_reduce(shared_output)
+        return tensor_model_parallel_all_reduce(shared_output)
+
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
@@ -1091,6 +1333,14 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        if (
+            self.use_latent_moe
+            and self._latent_proj_sharded
+            and routed_input.shape[-1] != self.moe_hidden_size
+        ):
+            # Column-sharded down_proj: restore the full-width latent with one
+            # attention-TP column all-gather.
+            routed_input = _gather_latent_columns(routed_input)
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
@@ -1103,7 +1353,6 @@ class KimiK3MoE(nn.Module):
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
             latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
         if shared_event is not None:
             # SBO join: as late as possible, so the side-stream shared experts
@@ -1111,15 +1360,34 @@ class KimiK3MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
-            # ones need the partial-sum reduction.
+            # ones need the partial-sum reduction — which on Hopper the
+            # row-sharded up projection's partial sums join (all-reduce is
+            # linear).
             if (
                 self.tp_size > 1
                 and not self._shared_experts_tp1
                 and not self._shared_experts_attn_tp_comm
             ):
+                if self._latent_proj_sharded:
+                    # Hopper: the row-sharded up projection's partial sums
+                    # ride the shared experts' node-local reduction.
+                    shared_output += out
+                    shared_output = attention_tensor_model_parallel_all_reduce(
+                        shared_output
+                    )
+                    return (
+                        shared_output
+                        if prefix_sum is None
+                        else shared_output + prefix_sum
+                    )
+                # Blackwell: the shared partial sums reduce over the full TP
+                # group; the replicated up projection is already complete.
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             out = _add3(out, shared_output, prefix_sum)
             return out
+        if self.use_latent_moe and self._latent_proj_sharded:
+            # No shared experts to ride: reduce the partial sums on their own.
+            out = attention_tensor_model_parallel_all_reduce(out)
         out = out if prefix_sum is None else out + prefix_sum
         return out
 
@@ -1238,7 +1506,10 @@ class KimiK3MoE(nn.Module):
         if self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
-            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+            # (fused: a single cast kernel emitting the dense buffer directly)
+            routed_input = routed_input.to(
+                dtype=hidden_states.dtype, memory_format=torch.contiguous_format
+            )
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1341,6 +1612,142 @@ class KimiK3MoE(nn.Module):
         # starts — only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
+    def _forward_hopper(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        """Hopper fused-front pipeline: read hidden_states once through the
+        merged [H, gate_up + E + latent] weight, then assemble the latent for
+        the TP-sharded experts:
+
+        - with DP attention (forward_batch given): the front runs on the
+          DP-LOCAL batch and one block all-gather assembles the global latent
+          from the attention-TP column shards — the transpose of the hidden
+          DP gather it replaces, with identical per-rank payload
+          (local_rows/attn_tp x moe_hidden == local_rows x
+          moe_hidden/attn_tp); the locally-computed top-k rides a row gather.
+          After the expert latent all-reduce everything scatters back to
+          local token space, so the shared MLP, the up projection and the
+          tail reduce all run on the DP-local batch (4x less work than the
+          gather-first flow at dp4).
+        - without DP attention: the front runs on the full batch and one
+          attention-TP column all-gather restores the full-width latent (the
+          cost of the non-dp column sharding).
+
+        Deliberately free of the Blackwell-only branches (k3_ar_fusion,
+        alt_stream SBO, deferred finalize); for that path see _forward_fused.
+        """
+        if TYPE_CHECKING:  # NOTE: precondition for this case
+            assert (
+                self._front_w is not None
+                and self._front_sizes is not None
+                and self.moe_hidden_size is not None
+                and self.shared_experts is not None
+                and isinstance(self.shared_experts.down_proj.weight, torch.Tensor)
+                and self.routed_expert_up_proj is not None
+                and self._latent_proj_sharded
+            )
+
+        num_tokens, hidden_size = hidden_states.shape
+        # Same fp32 front as _forward_fused (#33764): the router reads exact
+        # logits and the SiTU activation reads fp32 gate_up slices; only
+        # routed_input is rounded back to bf16 below, bit-identical to a
+        # bf16 front.
+        fused = _k3_bf16_gemm(
+            hidden_states,
+            self._front_w,
+            out_dtype=torch.float32 if self._front_fp32 else None,
+        )
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+            router_logits = router_logits.contiguous()
+        if self._moe_front_needs_dense_bf16:
+            # Off an fp32 front the cast allocates the dense buffer, so the
+            # contiguous() behind it is free; off a bf16 front it is the copy.
+            # Must run before the DP / column gathers below: they move the
+            # latent columns as raw bytes in the model dtype.
+            routed_input = routed_input.to(
+                dtype=hidden_states.dtype, memory_format=torch.contiguous_format
+            )
+        topk_output = self.topk(hidden_states, router_logits)
+
+        use_dp = (
+            self._dp_attention and forward_batch is not None and not self._ep_a2a
+        )
+        if use_dp:
+            global_rows = get_global_dp_buffer_len()
+            gathered_input = hidden_states.new_empty(
+                (global_rows, self.moe_hidden_size)
+            )
+            global_topk_ids = hidden_states.new_empty(
+                (global_rows, *topk_output.topk_ids.shape[1:]),
+                dtype=topk_output.topk_ids.dtype,
+            )
+            global_topk_weights = hidden_states.new_empty(
+                (global_rows, *topk_output.topk_weights.shape[1:]),
+                dtype=topk_output.topk_weights.dtype,
+            )
+            _dp_gather_moe_inputs(
+                gathered_input,
+                global_topk_ids,
+                global_topk_weights,
+                routed_input,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                forward_batch,
+            )
+            topk_output = topk_output._replace(
+                topk_ids=global_topk_ids, topk_weights=global_topk_weights
+            )
+            routed_input = gathered_input
+            moe_rows = global_rows
+        else:
+            if (
+                self._latent_proj_sharded
+                and routed_input.shape[-1] != self.moe_hidden_size
+            ):
+                # Non-DP Hopper: the column-sharded down_proj trades one extra
+                # attention-TP column all-gather for ~6GB/rank less front
+                # weight and 32x less down-proj compute.
+                routed_input = _gather_latent_columns(routed_input)
+            moe_rows = num_tokens
+        # Routed experts; their TP-partial sums reduce over the full TP group
+        # in latent space (before the RMSNorm).
+        latent = hidden_states.new_empty((moe_rows, self.moe_hidden_size))
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        try:
+            with zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(routed_input, topk_output)
+        finally:
+            route_quant_handoff.clear()
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+        latent = tensor_model_parallel_all_reduce(latent)
+
+        if use_dp:
+            local_latent = hidden_states.new_empty((num_tokens, self.moe_hidden_size))
+            dp_scatter(local_latent, latent, forward_batch)
+            latent = local_latent
+        latent = self._latent_norm(latent)
+        shared_output = hidden_states.new_empty((num_tokens, hidden_size))
+        self._forward_shared(gate_up, shared_output)
+        # The row-sharded up projection emits partial sums; added to the
+        # shared experts' partial sums, the combination is fully reduced by
+        # the one all-reduce the shared experts already needed (all-reduce
+        # is linear: AR(a + b) = AR(a) + AR(b)).
+        up_partial, _ = self.routed_expert_up_proj(latent)
+        shared_output += up_partial
+        shared_output = self._reduce_tail(shared_output)
+        if prefix_sum is None:
+            return shared_output
+        return shared_output + prefix_sum
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1365,13 +1772,23 @@ class KimiK3MoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
+        if use_dp and self._eligible_for_fused_front and not self._is_blackwell:
+            # DP + Hopper fused front: the front GEMM runs on the DP-local
+            # batch and the gather carries column-sharded latent blocks (see
+            # _forward_hopper) — no hidden gather at all.
+            return self._forward_hopper(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            ).view(num_tokens, hidden_size)
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            if self._is_blackwell:
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_hopper(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         if use_dp:

@@ -680,6 +680,19 @@ class MambaComponent(TreeComponent):
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert dst is not None, "Cannot alloc mamba for load_back"
+        # The H->D transfer restores only the checkpoint (conv + temporal); the
+        # ReplaySSM ring is not transferred. Reset the ring cursors so the first
+        # decode/verify on this slot reconstructs from the checkpoint alone --
+        # otherwise the previous owner's stale ring records get folded into the
+        # restored checkpoint and corrupt the live state (mirrors the resets in
+        # HybridReqToTokenPool.alloc and MambaPool.copy_from).
+        mamba_pool = self.cache.req_to_token_pool.mamba_pool
+        if mamba_pool.replayssm_write_pos is not None:
+            mamba_pool.replayssm_write_pos[dst] = 0
+        if mamba_pool.replayssm_cache_base is not None:
+            mamba_pool.replayssm_cache_base[dst] = 0
+        if mamba_pool.replayssm_is_flush is not None:
+            mamba_pool.replayssm_is_flush[dst] = 0
         req.kv.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 

@@ -72,6 +72,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
+    forward_is_dp_local_draft,
     freeze_gc,
     get_batch_sizes_to_capture,
 )
@@ -241,9 +242,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_gathered_buffer = (
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
+        # The dp-local draft exemption above extends to mlp_sync: with no
+        # cross-DP collective in the draft, DP-wide agreement is not needed
+        # to replay its graphs.
         self.require_mlp_sync = (
-            get_parallel().enable_dp_attention or self.require_gathered_buffer
-        )
+            get_parallel().enable_dp_attention
+            and not self._forward_is_dp_local(model_runner)
+        ) or self.require_gathered_buffer
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
@@ -608,19 +613,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
-        DP rank drafts independently with no cross-DP collective, so its
-        hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
-        if not model_runner.is_draft_worker:
-            return False
-        if not model_runner.spec_algorithm.is_dspark():
-            return False
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
-        )
-
-        return not draft_is_deepseek_v4()
+        return forward_is_dp_local_draft(model_runner)
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
@@ -1201,6 +1194,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
                     forward_batch.global_num_tokens_cpu,
+                    # Wire the replay-updated real per-rank counts so
+                    # mask_dp_pad_moe_topk_ids does not early-return on None.
+                    forward_batch.global_num_tokens_gpu,
                 )
                 set_is_extend_in_batch(False)
 

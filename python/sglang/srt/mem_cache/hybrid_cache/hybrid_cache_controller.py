@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -90,6 +91,20 @@ class PrefetchOperation(StorageOperation):
 
 
 class HybridCacheController(BaseHiCacheController):
+    def _check_logical_anchor_has_sidecars(self, operation) -> None:
+        anchor_host_pool = self.mem_pool_host
+        anchor_entry = getattr(anchor_host_pool, "anchor_entry", None)
+        if anchor_entry is not None:
+            anchor_host_pool = anchor_entry.host_pool
+        if (
+            isinstance(anchor_host_pool, LogicalHostPool)
+            and not operation.pool_transfers
+        ):
+            raise RuntimeError(
+                "LogicalHostPool anchor requires sidecar pool transfers for "
+                "hierarchical cache storage operations."
+            )
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -576,6 +591,8 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        self._check_logical_anchor_has_sidecars(operation)
+
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -631,6 +648,8 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        self._check_logical_anchor_has_sidecars(operation)
+
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
@@ -676,6 +695,8 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
+        self._check_logical_anchor_has_sidecars(operation)
+
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [

@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::protocols::{
+    anthropic::AnthropicMessagesRequest,
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
@@ -195,6 +196,20 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+    }
+
+    /// Route Anthropic Messages API requests (/v1/messages).
+    async fn route_anthropic_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &AnthropicMessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Anthropic messages endpoint not implemented",
+        )
+            .into_response()
     }
 
     /// Get router type name

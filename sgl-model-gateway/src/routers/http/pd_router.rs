@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, error::Error as StdError, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -29,6 +29,7 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
+        anthropic::AnthropicMessagesRequest,
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::{GenerationRequest, InputIds, StringOrArray},
@@ -70,6 +71,18 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+fn format_reqwest_error_chain(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut source = StdError::source(e);
+
+    while let Some(err) = source {
+        parts.push(err.to_string());
+        source = err.source();
+    }
+
+    parts.join(" | caused by: ")
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -908,6 +921,7 @@ impl PDRouter {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
+                    details = %format_reqwest_error_chain(&e),
                     "Decode request failed"
                 );
                 // Decode failed at TCP/transport level. No tracked
@@ -1271,18 +1285,16 @@ impl PDRouter {
             Ok(response) => response,
             Err(e) => {
                 error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
+                    "Prefill server failed (CRITICAL) prefill_url={} error={} details={}. PD attempt cannot complete without prefill KV cache.",
                     prefill_url,
-                    e
+                    e,
+                    format_reqwest_error_chain(&e)
                 );
 
                 // Return error immediately - don't wait for decode to timeout
                 return Err(error::bad_gateway(
                     "prefill_server_error",
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
+                    format!("Prefill server error: {}. PD attempt cannot complete without prefill KV cache.", e),
                 ));
             }
         };
@@ -1646,6 +1658,32 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_anthropic_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &AnthropicMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            let extracted = body.extract_text_for_routing();
+            (!extracted.is_empty()).then_some(extracted)
+        } else {
+            None
+        };
+
+        let context = PDRequestContext {
+            route: "/v1/messages",
+            batch_size: None,
+            is_stream: body.stream.unwrap_or(false),
+            return_logprob: false,
             request_text,
             model_id,
             headers: headers.cloned(),

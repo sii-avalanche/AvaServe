@@ -394,6 +394,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
+        self.use_humming = get_moe_runner_backend().is_humming()
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
@@ -468,9 +469,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_deep_gemm or self.use_mega_moe:
+        elif self.use_deep_gemm or self.use_mega_moe or self.use_humming:
             # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
             # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
+            # Humming's mxfp4 weight schema takes the same unpadded layout
+            # (padding is handled inside prepare_humming_moe_layer).
             pass
         elif get_platform().is_sm100:
             if self.use_flashinfer:
@@ -641,6 +644,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
+            return
+
+        if self.use_humming and not self.use_mega_moe:
+            from sglang.srt.layers.quantization.humming_utils import (
+                prepare_humming_moe_layer,
+            )
+
+            # Buffers already match humming's mxfp4 weight schema (packed
+            # uint8 e2m1 x2 + uint8 ue8m0 g32 scales); the helper views and
+            # re-lays them out for the Humming kernel in place.
+            prepare_humming_moe_layer(layer, {"quant_method": "mxfp4"})
+            layer._mxfp4_backend = "humming"
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
@@ -1236,6 +1251,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
+
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
         # via torch.zeros + slice assignment), so we feed them straight in.
@@ -1405,6 +1421,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_humming()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
@@ -1582,6 +1599,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
             return self._apply_marlin(layer, dispatch_output)
+
+        if self.use_humming:
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            from sglang.srt.layers.moe.moe_runner.humming import (
+                HummingMoeQuantInfo,
+            )
+
+            return self.runner.run(dispatch_output, HummingMoeQuantInfo(layer=layer))
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)

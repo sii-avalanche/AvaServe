@@ -396,20 +396,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a staging chunk RDMA is complete (every chunk;
         scatter is arrival-driven)."""
-        na = NetworkAddress(req.endpoint, req.dst_port)
-        self._send_multipart_locked(
-            na.to_tcp(),
-            [
-                b"CHUNK_READY",
-                str(req.room).encode("ascii"),
-                str(chunk_idx).encode("ascii"),
-                str(kv_chunk.index_slice.start).encode("ascii"),
-                str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                req.mooncake_session_id.encode("ascii"),
-                str(prefill_unique_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
-        )
+        try:
+            na = NetworkAddress(req.endpoint, req.dst_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"CHUNK_READY",
+                    str(req.room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(kv_chunk.index_slice.start).encode("ascii"),
+                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                    req.mooncake_session_id.encode("ascii"),
+                    str(prefill_unique_rank).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception:
+            pass
 
     def _do_staging_transfer(
         self,

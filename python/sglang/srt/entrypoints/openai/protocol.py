@@ -789,9 +789,9 @@ class ToolChoice(BaseModel):
 
 
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# none/no_think/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
 ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    "none", "no_think", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
 # The typed /v1/responses stream events validate against OpenAI's narrower
 # ``Reasoning.effort``; echoing a tier outside this set kills the stream.
@@ -869,7 +869,7 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'no_think', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
         "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -992,6 +992,7 @@ class ChatCompletionRequest(BaseModel):
                 effort = r.get("reasoning_effort")
             if isinstance(effort, str) and effort in {
                 "none",
+                "no_think",
                 "minimal",
                 "low",
                 "medium",
@@ -1024,7 +1025,7 @@ class ChatCompletionRequest(BaseModel):
 
         effort = values.get("reasoning_effort")
         if effort is not None:
-            thinking = effort != "none"
+            thinking = effort not in ("none", "no_think")
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")
@@ -1523,7 +1524,7 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts the OpenAI string tiers "
-        "('none','minimal','low','medium','high','xhigh','max').",
+        "('none','no_think','minimal','low','medium','high','xhigh','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1774,11 +1775,13 @@ class ResponsesRequest(BaseModel):
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
             max_tokens = min(self.max_output_tokens, default_max_tokens)
+            # Headroom for BOS/EOS the engine appends on top of prompt+budget.
+            max_tokens -= 2
         else:
-            max_tokens = default_max_tokens
-
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        max_tokens -= 2
+            # Leave unset and let the scheduler clamp max_new_tokens to the
+            # remaining context AFTER multimodal inputs are expanded, so that
+            # image tokens are accounted for correctly.
+            max_tokens = None
 
         temperature = self.temperature
         if temperature is None:

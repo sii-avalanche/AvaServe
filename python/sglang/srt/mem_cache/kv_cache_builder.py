@@ -7,7 +7,6 @@ logger = logging.getLogger(__name__)
 from dataclasses import dataclass
 from typing import Optional
 
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KVCacheBuildResult:
     is_hybrid_swa: bool
@@ -287,6 +286,39 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    hicache_sync_group = None
+    if enable_hierarchical_cache:
+        # Every (pp, attn_tp, attn_cp) rank sharing this attention DP rank:
+        # their hicache ready-count pops must stay identical so the
+        # replicated tree metadata cannot diverge.
+        if ps.pp_size == 1 and ps.attn_cp_size == 1:
+            # Same membership as the existing attn-tp cpu group; reuse it
+            # instead of creating a duplicate gloo group.
+            hicache_sync_group = (
+                attn_tp_cpu_group
+                if get_parallel().enable_dp_attention
+                else tp_cpu_group
+            )
+        else:
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
+            )
+
+            # create_custom_parallel_group negotiates via a world-level
+            # all_gather_object first, so every rank creates every group in
+            # the same order; a bare new_group from disjoint rank subsets
+            # races on the shared store counter and can deadlock.
+            attn_stage_size = ps.attn_cp_size * ps.attn_tp_size
+            dp_offset = ps.attn_dp_rank * attn_stage_size
+            hicache_sync_group = create_custom_parallel_group(
+                group_ranks=[
+                    pp_rank * ps.tp_size + dp_offset + i
+                    for pp_rank in range(ps.pp_size)
+                    for i in range(attn_stage_size)
+                ],
+                backend="gloo",
+            )
+
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
@@ -306,6 +338,7 @@ def build_kv_cache(
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
+        hicache_sync_group=hicache_sync_group,
         eviction_policy=get_memory().radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,

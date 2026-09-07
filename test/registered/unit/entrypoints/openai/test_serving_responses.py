@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -8,13 +8,14 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import collect_stream_events, event_payloads, event_types, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
+    ResponsesResponse,
 )
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
@@ -30,6 +31,46 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
+    def test_previous_function_call_is_replayed_before_tool_output(self):
+        serving = make_serving()
+        serving.msg_store = {
+            "resp_prev": [{"role": "user", "content": "Run pwd."}]
+        }
+        prev_response = ResponsesResponse(
+            id="resp_prev",
+            model="x",
+            output=[
+                ResponseFunctionToolCall(
+                    id="fc_1",
+                    call_id="call_1",
+                    name="shell",
+                    arguments='{"cmd":"pwd"}',
+                    type="function_call",
+                )
+            ],
+            status="completed",
+        )
+        request = ResponsesRequest(
+            model="x",
+            previous_response_id="resp_prev",
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "/workspace\n",
+                }
+            ],
+        )
+
+        messages = serving._construct_input_messages(request, prev_response)
+
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(messages[1]["tool_calls"][0]["function"]["name"], "shell")
+        self.assertEqual(messages[2]["role"], "tool")
+        self.assertEqual(messages[2]["tool_call_id"], "call_1")
+        self.assertEqual(messages[2]["content"], "/workspace\n")
+
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
         prev_response = Mock(id="resp_prev")
@@ -123,6 +164,84 @@ class InputMessageConstructionTestCase(CustomTestCase):
             ],
         )
 
+    def test_function_call_output_parts_normalized_for_chat_templates(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "call f"}],
+                },
+                {
+                    "type": "function_call",
+                    "name": "f",
+                    "call_id": "call_abc",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [{"type": "input_text", "text": "ok"}],
+                },
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request)
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "call f"}],
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_abc",
+                    "content": [{"type": "text", "text": "ok"}],
+                },
+            ],
+        )
+
+    def test_function_call_output_parts_normalized_for_harmony(self):
+        serving = make_serving()
+        serving.use_harmony = True
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "function_call",
+                    "name": "f",
+                    "call_id": "call_abc",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [{"type": "input_text", "text": "ok"}],
+                },
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages_with_harmony(request, None)
+
+        self.assertEqual(messages[-1].author.role.value, "tool")
+        self.assertEqual(messages[-1].author.name, "functions.f")
+        self.assertEqual([part.text for part in messages[-1].content], ["ok"])
+
     def test_previous_response_id_input_list_does_not_call_copy_module(self):
         serving = make_serving()
         serving.use_harmony = True
@@ -198,6 +317,48 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(seen["tool_choice"], "required")
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
+
+    def test_named_function_tool_choice_is_forwarded_to_chat_processing(self):
+        serving = make_serving()
+        seen = {}
+
+        def fake_process(chat_request, is_multimodal):
+            seen["tool_choice"] = chat_request.tool_choice
+            return MessageProcessingResult(
+                prompt="prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+
+        serving._process_messages = Mock(side_effect=fake_process)
+        request = ResponsesRequest(
+            model="x",
+            input="call the shell tool",
+            tools=[{"type": "function", "name": "shell"}],
+            tool_choice={"type": "function", "name": "shell"},
+            store=False,
+        )
+
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertEqual(seen["tool_choice"].type, "function")
+        self.assertEqual(seen["tool_choice"].function.name, "shell")
+
+    def test_minimal_reasoning_effort_disables_chat_reasoning(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x", input="hi", reasoning={"effort": "minimal"}
+        )
+
+        self.assertEqual(
+            serving._chat_reasoning_effort_from_response(request), "none"
+        )
 
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
@@ -481,6 +642,138 @@ class FullResponseUsageTestCase(CustomTestCase):
         self.assertEqual(response.usage.reasoning_tokens, 2)
         self.assertEqual(metadata.final_usage_info, response.usage)
 
+    def test_cancelled_full_response_aborts_engine_request(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x", input="hello", request_id="resp_cancel", store=False
+        )
+
+        async def cancelled_generator():
+            raise asyncio.CancelledError
+            yield
+
+        result = asyncio.run(
+            serving.responses_full_generator(
+                request,
+                sampling_params={},
+                result_generator=cancelled_generator(),
+                context=SimpleContext(),
+                model_name="x",
+                tokenizer=serving.tokenizer_manager.tokenizer,
+                request_metadata=RequestResponseMetadata(
+                    request_id=request.request_id
+                ),
+            )
+        )
+
+        serving.tokenizer_manager.abort_request.assert_called_once_with(
+            rid="resp_cancel"
+        )
+        self.assertEqual(result.status_code, 400)
+
+
+class StreamingDisconnectTestCase(unittest.TestCase):
+    def test_glm_stream_emits_reasoning_and_tool_call_deltas(self):
+        serving = make_serving()
+        serving.reasoning_parser = "glm45"
+        serving.tool_call_parser = "glm47"
+        request = ResponsesRequest(
+            model="x",
+            input="run pwd",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+        chunks = [
+            "Need to run pwd.</think>",
+            (
+                "Need to run pwd.</think>"
+                "<tool_call>shell<arg_key>cmd</arg_key>"
+                "<arg_value>pwd</arg_value></tool_call>"
+            ),
+        ]
+
+        async def result_generator():
+            for text in chunks:
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "finish_reason": {"type": "tool_calls"},
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                    },
+                }
+
+        events = asyncio.run(
+            collect_stream_events(
+                serving.responses_stream_generator_non_harmony(
+                    request,
+                    sampling_params={},
+                    result_generator=result_generator(),
+                    model_name="x",
+                    tokenizer=serving.tokenizer_manager.tokenizer,
+                    request_metadata=RequestResponseMetadata(
+                        request_id=request.request_id
+                    ),
+                )
+            )
+        )
+
+        types = event_types(events)
+        payloads = event_payloads(events)
+        argument_deltas = [
+            payload["delta"]
+            for event_type, payload in zip(types, payloads)
+            if event_type == "response.function_call_arguments.delta"
+        ]
+        self.assertIn("response.reasoning_text.delta", types)
+        self.assertIn("response.function_call_arguments.done", types)
+        self.assertEqual("".join(argument_deltas), '{"cmd": "pwd"}')
+
+    def test_disconnected_stream_aborts_engine_request(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            request_id="resp_disconnect",
+            stream=True,
+            store=False,
+        )
+
+        async def result_generator():
+            yield {"text": "ignored", "meta_info": {}}
+
+        raw_request = Mock()
+        raw_request.is_disconnected = AsyncMock(return_value=True)
+
+        async def collect():
+            return [
+                event
+                async for event in serving.responses_stream_generator_non_harmony(
+                    request,
+                    sampling_params={},
+                    result_generator=result_generator(),
+                    model_name="x",
+                    tokenizer=serving.tokenizer_manager.tokenizer,
+                    request_metadata=RequestResponseMetadata(
+                        request_id=request.request_id
+                    ),
+                    raw_request=raw_request,
+                )
+            ]
+
+        asyncio.run(collect())
+
+        serving.tokenizer_manager.abort_request.assert_called_once_with(
+            rid="resp_disconnect"
+        )
+
 
 class MultimodalRequestTestCase(CustomTestCase):
     def test_text_only_create_responses_rejects_media_before_generation(self):
@@ -758,6 +1051,38 @@ class OutputItemsTestCase(CustomTestCase):
 
         self.assertEqual(len(output_items), 1)
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
+
+    def test_glm_reasoning_is_removed_before_tool_call_parsing(self):
+        serving = make_serving()
+        serving.reasoning_parser = "glm45"
+        serving.tool_call_parser = "glm47"
+        request = ResponsesRequest(
+            model="x",
+            input="run pwd",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+        output_items = serving._make_response_output_items(
+            request,
+            (
+                "Need to run pwd.</think>"
+                "<tool_call>shell<arg_key>cmd</arg_key>"
+                "<arg_value>pwd</arg_value></tool_call>"
+            ),
+            serving.tokenizer_manager.tokenizer,
+        )
+
+        self.assertEqual(
+            [item.type for item in output_items], ["reasoning", "function_call"]
+        )
+        self.assertEqual(output_items[0].content[0].text, "Need to run pwd.")
+        self.assertEqual(output_items[1].arguments, '{"cmd": "pwd"}')
 
 
 class HarmonyResponsesTestCase(CustomTestCase):

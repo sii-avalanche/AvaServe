@@ -924,6 +924,7 @@ class DeepseekV2MoE(nn.Module):
                     self.layer_id,
                     fwd.fuse_mlp_allreduce,
                     fwd.mlp_reduce_scatter,
+                    skip_shared_experts,
                 )
             elif (
                 self.alt_stream is not None
@@ -936,6 +937,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    skip_shared_experts=skip_shared_experts,
                 )
             else:
                 return self.forward_normal(
@@ -956,24 +958,35 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        skip_shared_experts: bool = False,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
         # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
         #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
+        #
+        # skip_shared_experts (the SGLANG_DP_SHARED_EXPERT_LOCAL PoC in
+        # deepseek_v4): the TP1 shared expert is computed on the LOCAL hidden
+        # in the decoder layer and added AFTER the combine; computing it here
+        # on the gathered global buffer would double-count it — and when the
+        # post-experts all-reduce is skipped for a downstream reduce_scatterv,
+        # the replicated shared output is summed once per EP rank
+        # (R + ep_size*S; see sgl-project/sglang#31475).
         use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
         current_stream = torch.cuda.current_stream()
         # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE) must happen on the main
         # stream BEFORE the alt-stream fork so both consumers see it.
         pre_quant_input = (
             None
-            if use_flashinfer_trtllm_bypass
+            if use_flashinfer_trtllm_bypass or skip_shared_experts
             else self._maybe_quant_moe_input_once(hidden_states)
         )
         self.alt_stream.wait_stream(current_stream)
         has_shared_output = (
-            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
+            hidden_states.shape[0] > 0
+            and self.num_fused_shared_experts == 0
+            and not skip_shared_experts
         )
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
@@ -1027,14 +1040,17 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states,
-                gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
-            )
+        if has_shared_output:
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    pre_quant_input=pre_quant_input,
+                )
 
-        current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            shared_output = None
 
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1059,7 +1075,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
-        if self._shared_expert_tp1:
+        if self._shared_expert_tp1 and shared_output is not None:
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -3278,6 +3294,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
     layer_id: int,
     fuse_mlp_allreduce: bool,
     mlp_reduce_scatter: bool,
+    skip_shared_experts: bool = False,
 ) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
     assert forward_context is not None
@@ -3293,7 +3310,9 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
     ):
-        return moe_fusion.forward_normal_dual_stream(hidden_states)
+        return moe_fusion.forward_normal_dual_stream(
+            hidden_states, skip_shared_experts=skip_shared_experts
+        )
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

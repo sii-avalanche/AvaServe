@@ -104,16 +104,6 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
-                with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.request_receiver.recv_requests()
-                    self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -145,6 +135,20 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                # Receive + fan out requests while the just-launched batch runs
+                # on the GPU, instead of leaving this CPU work in the GPU-idle
+                # tail after the output wait. Requests received here become
+                # schedulable from the next microbatch slot on.
+                with torch.profiler.record_function("recv_requests"):
+                    recv_reqs = self.request_receiver.recv_requests()
+                    self.process_input_requests(recv_reqs)
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -579,6 +583,14 @@ class SchedulerPPMixin:
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        # (last rank) own (launch_event, outputs) keyed by microbatch slot,
+        # consumed locally in place of receiving them back around the PP ring
+        # (see _do_recv).
+        self._pp_local_output_proxies: List[
+            Optional[Tuple[torch.Event, PPProxyTensors]]
+        ] = [
+            None
+        ] * self.pp_loop_size
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1102,6 +1114,12 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            if self.launch_event is not None:
+                # See _do_recv: post the recv only after the just-launched
+                # forward completes, so the resident NCCL recv kernel cannot
+                # stall the cooperative flashinfer MLA decode kernels in the
+                # running decode graph.
+                torch.cuda.current_stream().wait_event(self.launch_event)
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
@@ -1251,7 +1269,13 @@ class SchedulerPPMixin:
                         )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
-            if pp_outputs:
+            # The relay stops at pp_size-2 for any pp_size: outputs only need
+            # to reach ranks 0..pp_size-2 (rank 0 needs the tokens for
+            # embedding, the rest for bookkeeping). The last rank consumes its
+            # own outputs from the local stash (see _do_recv), so the final
+            # hop back to the data's origin is pure echo. pp_size == 2 is the
+            # special case where rank 0 does not relay at all.
+            if self.ps.pp_rank < self.ps.pp_size - 2 and pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
@@ -1310,10 +1334,37 @@ class SchedulerPPMixin:
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
-            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+            if self.pp_group.is_last_rank:
+                # The outputs were produced by this rank; consume the copy
+                # stashed at launch time instead of receiving them back around
+                # the ring. Values are identical (sampling is replicated
+                # across the TP group), only the transport is skipped.
+                stashed = self._pp_local_output_proxies[next_mb_id]
+                assert stashed is not None
+                produce_event, next_pp_outputs = stashed
+            else:
+                if self.launch_event is not None:
+                    # Post the recv only after the just-launched forward
+                    # completes: ProcessGroupNCCL syncs its internal p2p
+                    # stream with the current stream (syncStream), so the
+                    # NCCL recv kernel only becomes device-resident then.
+                    # Otherwise the resident recv kernel conflicts with the
+                    # flashinfer MLA decode kernels in the decode graph:
+                    # they are cooperative launches requiring the whole
+                    # device (all SMs) co-resident, and stall mid-graph
+                    # until the recv kernel completes.
+                    torch.cuda.current_stream().wait_event(self.launch_event)
+                with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                    next_pp_outputs = PPProxyTensors(
+                        self._pp_recv_dict_from_prev_stage()
+                    )
+                produce_event = None
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
+                if produce_event is not None:
+                    # Order the read of the stashed tensors after the forward
+                    # (sampling) that produced them.
+                    self.copy_stream.wait_event(produce_event)
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
@@ -1359,14 +1410,14 @@ class SchedulerPPMixin:
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
-                    last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
-                        )
+                    proxy = PPProxyTensors(
+                        self._pp_prepare_tensor_dict(result, cur_batch)
                     )
+                    last_rank_comm_queue.append((event, proxy))
+                    # The outputs originate from this rank; keep a local copy
+                    # so the output processing of this microbatch can read it
+                    # directly instead of receiving it back around the PP ring.
+                    self._pp_local_output_proxies[mb_id] = (event, proxy)
         return result, event
 
     def get_rids(

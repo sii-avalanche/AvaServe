@@ -675,7 +675,13 @@ def build_decode_registry(
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
             if require_gathered_buffer:
-                buf.fill_(ctx.padded_num_tokens)
+                # mask_dp_pad_moe_topk_ids (the only reader) needs the REAL
+                # per-rank counts to find pad rows, not the padded geometry.
+                fb_counts = getattr(fb, "global_num_tokens_gpu", None)
+                if fb_counts is not None:
+                    buf.copy_(fb_counts)
+                else:
+                    buf.fill_(ctx.padded_num_tokens)
 
         _global_shape = (
             (lambda _bs, _mt: (dp_size,))

@@ -40,6 +40,7 @@ use crate::{
         otel_trace,
     },
     protocols::{
+        anthropic::AnthropicMessagesRequest,
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
@@ -75,6 +76,7 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
+    pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 async fn parse_function_call(
@@ -157,6 +159,27 @@ async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> Response {
+    match &state.prometheus_handle {
+        Some(handle) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            handle.render(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn standalone_prometheus_metrics(
+    State(handle): State<metrics_exporter_prometheus::PrometheusHandle>,
+) -> impl IntoResponse {
+    (
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        handle.render(),
+    )
+}
+
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_server_info(req).await
 }
@@ -200,6 +223,17 @@ async fn v1_completions(
     state
         .router
         .route_completion(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<AnthropicMessagesRequest>,
+) -> Response {
+    state
+        .router
+        .route_anthropic_messages(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -545,6 +579,7 @@ pub fn build_app(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route("/v1/messages", post(v1_anthropic_messages))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
@@ -596,6 +631,7 @@ pub fn build_app(
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
+        .route("/metrics", get(prometheus_metrics))
         .route("/v1/models", get(v1_models))
         .route("/model_info", get(get_model_info))
         // TODO: Remove `/get_model_info` alias after one release-cycle deprecation window.
@@ -729,9 +765,40 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         None
     };
 
-    if let Some(prometheus_config) = &config.prometheus_config {
-        metrics::start_prometheus(prometheus_config.clone());
-    }
+    let prometheus_handle = if let Some(prometheus_config) = &config.prometheus_config {
+        let handle = metrics::start_prometheus(prometheus_config.clone());
+
+        let upkeep_handle = handle.clone();
+        spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+                upkeep_handle.run_upkeep();
+            }
+        });
+
+        let listener_handle = handle.clone();
+        let prom_host = prometheus_config.host.clone();
+        let prom_port = prometheus_config.port;
+        spawn(async move {
+            let app = Router::new()
+                .route("/metrics", get(standalone_prometheus_metrics))
+                .with_state(listener_handle);
+            let addr = format!("{}:{}", prom_host, prom_port);
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    info!("Prometheus metrics listener on {}", addr);
+                    if let Err(e) = axum::serve(listener, app).await {
+                        error!("Prometheus listener failed: {}", e);
+                    }
+                }
+                Err(e) => error!("Failed to bind Prometheus listener on {}: {}", addr, e),
+            }
+        });
+
+        Some(handle)
+    } else {
+        None
+    };
 
     let (mesh_handler, mesh_sync_manager) = if let Some(mesh_server_config) =
         &config.mesh_server_config
@@ -987,6 +1054,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_sync_manager,
+        prometheus_handle,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {

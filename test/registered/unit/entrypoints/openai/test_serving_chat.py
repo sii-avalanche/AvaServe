@@ -3014,6 +3014,29 @@ class ServingChatTestCase(unittest.TestCase):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
+    def test_glm45_reasoning_effort_dispatch(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "glm45"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+        disabled_by_effort = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort="no_think",
+        )
+        disabled_by_template = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        enabled = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        self.assertFalse(chat._get_reasoning_from_request(disabled_by_effort))
+        self.assertFalse(chat._get_reasoning_from_request(disabled_by_template))
+        self.assertTrue(chat._get_reasoning_from_request(enabled))
+
     def _setup_nemotron_super(self):
         """Drive _apply_jinja_template (chat_template_name=None) with a
         Nemotron-3 Super reasoning_config carrying effort_kwarg."""
@@ -3499,6 +3522,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_named_levels(self):
         parse = OpenAIServingChat._parse_inkling_reasoning_effort
         self.assertEqual(parse("none"), 0.0)
+        self.assertEqual(parse("no_think"), 0.0)
         self.assertEqual(parse("minimal"), 0.1)
         self.assertEqual(parse("low"), 0.2)
         self.assertEqual(parse("medium"), 0.7)

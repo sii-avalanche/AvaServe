@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.zero_copy_context import get_moe_output_spec
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
@@ -100,6 +101,7 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     # Bailing clamps after SiLU, which the kernel only implements in its
     # SwigluStep variant.
     use_swiglu_step: bool = False
+
 
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
@@ -195,7 +197,7 @@ def _run_flashinfer_cutlass(
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
 ) -> torch.Tensor:
-    flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
+    flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
 
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
@@ -320,7 +322,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         quant_info, FlashInferCutlassMxfp4MoeQuantInfo
     ), f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
 
-    flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
+    flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -406,8 +408,19 @@ def fused_experts_none_to_flashinfer_mxfp4(
     # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
+    # Honor a published zero-copy destination (e.g. K3 _forward_hopper's
+    # latent buffer) before allocating; writing the combine output there
+    # directly skips the copy_ back in the caller.
+    out = get_moe_output_spec(
+        torch.Size((x.shape[0], out_hidden)), output_dtype, x.device
+    )
+    if out is None:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            out = torch.empty(
+                x.shape[0], out_hidden, dtype=output_dtype, device=x.device
+            )
 
     flashinfer_cutlass_fused_moe(
         input=x,

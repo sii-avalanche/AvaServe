@@ -153,6 +153,8 @@ class HummingRunnerCore(MoeRunnerCore):
         self.global_num_experts = config.num_experts
         self.activation = config.activation
         self.swiglu_limit = config.swiglu_limit
+        self.situ_beta = config.gemm1_alpha
+        self.situ_linear_beta = config.gemm1_clamp_limit
         self.layer: torch.nn.Module | None = None
         self.humming_gemm_configs = {}
         HummingRunnerCore.runner_cores[id(self)] = self
@@ -398,6 +400,17 @@ class HummingRunnerCore(MoeRunnerCore):
             from sgl_kernel import silu_and_mul
 
             silu_and_mul(inputs, outputs)
+        elif self.activation == "situ":
+            # Kimi-K3 SiTU (softcap GLU), same semantics as the marlin path's
+            # fused_marlin_moe.situ_and_mul.
+            from sglang.kernels.ops.kimi_k3 import situ_and_mul
+
+            situ_and_mul(
+                inputs,
+                outputs,
+                self.situ_beta if self.situ_beta is not None else 4.0,
+                self.situ_linear_beta,
+            )
         elif self.activation == "gelu":
             from sgl_kernel import gelu_and_mul
 

@@ -117,6 +117,18 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+# Minimum per-tensor size for send-allgather slicing in tensor-dict P2P.
+# Every rank in the all_gather_group already holds a full replica, so slicing
+# only saves wire bytes; below this size the direct full send is cheap (a few
+# hundred KB, tens of microseconds on RDMA) and skipping the reassembly
+# allgather avoids queueing it behind the in-flight forward's collectives on
+# the same communicator stream. Decode-time PP dicts (output tokens, proxy
+# hidden states) take the direct send; prefill-chunk proxies (hundreds of MB)
+# keep slicing. Both send and recv sides derive the decision from the same
+# tensor metadata, so they always agree.
+TENSOR_DICT_SLICE_MIN_BYTES = 1 << 20
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -1736,7 +1748,11 @@ class GroupCoordinator:
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+                and tensor.nbytes >= TENSOR_DICT_SLICE_MIN_BYTES
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1783,6 +1799,7 @@ class GroupCoordinator:
                 use_all_gather = (
                     all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
+                    and tensor.nbytes >= TENSOR_DICT_SLICE_MIN_BYTES
                 )
 
                 if use_all_gather:

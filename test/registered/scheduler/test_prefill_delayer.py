@@ -359,6 +359,110 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=True,
         expected_reason="no_wait",
     ),
+    # max_prefill_bs is a historical high-water mark. A previous batch of 12
+    # must not require 12 free slots when only one request is currently
+    # waiting. With max_running=16 and running=8, the current one-slot demand
+    # fits and should be admitted immediately.
+    NegotiateTestCase(
+        name="slot_trigger_uses_current_waiting_demand",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=16,
+            ),
+            # Repeat the call so the legacy behavior cannot pass only because
+            # skip_first_delayer consumed the first would-be delay.
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=16,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+        expected_wait_forward_passes=0,
+    ),
+    # The slot trigger should still delay when the current waiting demand does
+    # not fit. Here only four slots are free but eight requests are waiting.
+    NegotiateTestCase(
+        name="slot_trigger_delays_current_demand",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[12, 12, 12, 12],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=16,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[12, 12, 12, 12],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=16,
+            ),
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    # The all-prefillable slot path must obey max_delay_passes just like the
+    # mixed path. The first call is allowed by skip_first_delayer, followed by
+    # two real delays and then a timeout release.
+    NegotiateTestCase(
+        name="slot_trigger_pass_timeout",
+        max_delay_passes=3,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[12, 12, 12, 12],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=16,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[12, 12, 12, 12],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=16,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[12, 12, 12, 12],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=16,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[12, 12, 12, 12],
+                max_prefill_bs=[12, 12, 12, 12],
+                waiting_queue_len=[8, 8, 8, 8],
+                max_running_requests=16,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+        expected_wait_forward_passes=2,
+    ),
     # max_delay_ms wall-clock timeout: once a single queue-trigger delay
     # exceeds the cap, prefill must be force-released.
     # Call sequence:

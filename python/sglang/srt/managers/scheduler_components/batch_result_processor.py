@@ -1178,28 +1178,32 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
-            if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
-            else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
-                is_insert = (
-                    req.mamba_lazy_is_insert
-                    if mamba_extra_buffer_lazy_enabled()
-                    else True
-                )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+            self._release_finished_req_resources(req)
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _release_finished_req_resources(self, req: Req) -> None:
+        if get_disagg().disaggregation_decode_enable_offload_kvcache:
+            # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes.
+            if not self.decode_offload_manager.offload_kv_cache(req):
+                self.decode_offload_manager.finalize_release_on_finish(req)
+            return
+
+        if get_memory().enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+        is_insert = (
+            req.mamba_lazy_is_insert
+            if mamba_extra_buffer_lazy_enabled()
+            else True
+        )
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _maybe_update_reasoning_tokens(
         self,

@@ -26,6 +26,10 @@ class CacheInitParams:
     attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    # Gloo group spanning every (pp, attn_tp, attn_cp) rank that shares this
+    # attention DP rank; hicache ready-count reductions run on it so all
+    # replicas pop identical counts. Created only with hierarchical cache on.
+    hicache_sync_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 

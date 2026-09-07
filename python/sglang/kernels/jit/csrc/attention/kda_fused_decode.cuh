@@ -29,6 +29,10 @@
 //     dispatch by grid size);
 //   * PDL (kUsePDL, plumbed like kda_packed_decode): griddepcontrol wait at
 //     kernel entry, launch_dependents at every exit.
+//   * bf16 recurrent-state pools (--mamba-ssm-dtype bfloat16) via the TState
+//     template: global loads widen bf16 -> fp32 into the same fp32 smem
+//     staging, the writeback rounds fp32 -> bf16 (RTNE, matching the triton
+//     chain); TMA staging stays fp32-only (raw byte moves cannot widen).
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
@@ -162,6 +166,24 @@ SGL_DEVICE void store_state_float4(float* ptr, float4 value) {
   }
 }
 
+// bf16 pool writeback: the fp32 recurrent values round to bf16 (RTNE, matching
+// the unfused triton chain's `.to(p_ht.dtype.element_ty)`) and store as one 8B
+// unit. Same alignment contract as the fp32 path (k_base % 4 == 0, 256B row
+// pitch, slot pitch a multiple of 4 elements).
+template <bool kUseCacheGlobalStore>
+SGL_DEVICE void store_state_float4(__nv_bfloat16* ptr, float4 value) {
+  const __nv_bfloat162 lo = __floats2bfloat162_rn(value.x, value.y);
+  const __nv_bfloat162 hi = __floats2bfloat162_rn(value.z, value.w);
+  uint2 packed;
+  packed.x = *reinterpret_cast<const uint32_t*>(&lo);
+  packed.y = *reinterpret_cast<const uint32_t*>(&hi);
+  if constexpr (kUseCacheGlobalStore) {
+    __stcg(reinterpret_cast<uint2*>(ptr), packed);
+  } else {
+    *reinterpret_cast<uint2*>(ptr) = packed;
+  }
+}
+
 template <int kCopyThreads>
 SGL_DEVICE void
 cp_async_state_chunk_for(float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
@@ -184,6 +206,47 @@ cp_async_state_chunk_for(float* s_state, const float* state, int slot, int i_hv,
 SGL_DEVICE void
 cp_async_state_chunk(float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
   cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, state_slot_stride, chunk);
+}
+
+// bf16 pool: plain 8B vector loads widened to fp32 on the way into the SAME
+// fp32 smem staging (cp.async/TMA move raw bytes and cannot convert). The
+// cp.async commit/wait protocol degrades to a no-op for these synchronous
+// stores; the per-thread write/read pairing is identical to the fp32 path, so
+// the existing __syncwarp() still covers cross-lane visibility. Half the gmem
+// state bytes of the fp32 path.
+SGL_DEVICE void load_state_chunk_bf16(
+    float* s_state, const __nv_bfloat16* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
+  constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
+  const int tid = threadIdx.x;
+  const int stage = chunk & 1;
+  const int v_base = chunk * kChunkV;
+  const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
+  for (int linear4 = tid; linear4 < kFloat4PerChunk; linear4 += kThreads) {
+    const int elem = linear4 * 4;
+    const int row = elem / kDimK;
+    const int k = elem - row * kDimK;
+    float* dst = s_state + (stage * kChunkV + row) * kDimK + k;
+    const __nv_bfloat16* src = state + slot_base + ((i_hv * kDimV + v_base + row) * kDimK + k);
+    // 4 bf16 = 8B: aligned because k % 4 == 0, the row pitch is 256B, and the
+    // host requires the slot pitch to be a multiple of 4 elements.
+    const uint2 raw = *reinterpret_cast<const uint2*>(src);
+    const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+    const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+    *reinterpret_cast<float4*>(dst) =
+        make_float4(__bfloat162float(lo.x), __bfloat162float(lo.y), __bfloat162float(hi.x), __bfloat162float(hi.y));
+  }
+}
+
+// Pool-dtype dispatch for state staging: fp32 pools use cp.async; bf16 pools
+// use the synchronous widening load above.
+SGL_DEVICE void
+load_state_chunk(float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
+  cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk);
+}
+
+SGL_DEVICE void
+load_state_chunk(float* s_state, const __nv_bfloat16* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
+  load_state_chunk_bf16(s_state, state, slot, i_hv, state_slot_stride, chunk);
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -386,7 +449,12 @@ template <
     bool kApplyBetaSigmoid = true,
     bool kUseTmaLoad = false,
     int kTmaStages = kNumChunks,
-    bool kUsePDL = false>
+    bool kUsePDL = false,
+    // Recurrent-state pool element type: float (dense fp32 pool) or
+    // __nv_bfloat16 (--mamba-ssm-dtype bfloat16). Compute and the smem staging
+    // stay fp32 either way; only the gmem load/writeback convert. TMA staging
+    // moves raw bytes and is therefore fp32-only (host forces it off for bf16).
+    typename TState = float>
 // Shapes below use K3's per-TP-rank sizing (linear_attn_config: num_heads=96 over
 // TP={8,16,32} -> H=HV={12,6,3} local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128;
 // short_conv_kernel_size=4 -> kKernelWidth=4, kConvStateWidth=3). B is the live
@@ -415,8 +483,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     const int* __restrict__ ssm_state_indices,  // [B] recurrent-state slot per token; <0 marks a padded cuda-graph slot
     const int* __restrict__ cu_seqlens,         // [B+1] token offsets into x_q/x_k/x_v/g/beta; unused under
                                                 // kUseStaticDecodeLayout
-    float* __restrict__ state,  // [slots, HV, 128, 128] recurrent KDA state h, inner [V,K] contiguous, slot pitch =
-                                // state_slot_stride
+    TState* __restrict__ state,  // [slots, HV, 128, 128] recurrent KDA state h, inner [V,K] contiguous, slot pitch =
+                                 // state_slot_stride
     __nv_bfloat16* __restrict__ out,  // [B, hv_count*128] fused-decode output, row i_n, col i_hv*128 + v
     int B,                            // live decode batch size (token count for this launch)
     int H,                            // local key/query heads on this TP rank
@@ -518,7 +586,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       }
     }
   } else {
-    cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 0);
+    load_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 0);
   }
 
   if constexpr (kUpdateConvState) {
@@ -666,7 +734,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   __syncthreads();
 
   if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk && kNumChunks > 1) {
-    cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 1);
+    load_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 1);
   }
 
   const float q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
@@ -715,7 +783,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
     if constexpr (!kUseTmaLoad && !kPrefetchNextStateChunk) {
       if (chunk + 1 < kNumChunks) {
-        cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk + 1);
+        load_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk + 1);
       }
     }
 
@@ -805,7 +873,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       }
     } else if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk) {
       if (chunk + 2 < kNumChunks) {
-        cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk + 2);
+        load_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk + 2);
       }
     }
   }
@@ -887,7 +955,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 // and lower-bounded sigmoid) and selected at launch from the model config.
 // kUseTmaLoad/kTmaStages select the 1D-TMA state-staging path in place of the
 // cp.async fallback used for a misaligned recurrent-state slot stride.
-template <int kFixedHeads, bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
+template <int kFixedHeads,
+          bool kUseLowerBound,
+          bool kUsePDL,
+          bool kUseTmaLoad = false,
+          int kTmaStages = kNumChunks,
+          typename TState = float>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true,
     /*kUseStaticDecodeLayout=*/true,
@@ -907,20 +980,28 @@ constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyBetaSigmoid=*/true,
     kUseTmaLoad,
     kTmaStages,
-    kUsePDL>;
+    kUsePDL,
+    TState>;
 
-template <int kFixedHeads, bool kUsePDL>
+template <int kFixedHeads, bool kUsePDL, typename TState = float>
 auto select_kda_fused_decode_k3_kernel(bool use_lower_bound, int tma_stages) {
-  if (tma_stages == 3) {
-    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3>
-                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3>;
+  if constexpr (!std::is_same_v<TState, float>) {
+    // bf16 pools always take the synchronous widening-load variant: TMA stages
+    // raw bytes and cannot widen to fp32 (the host forces tma_stages == 0).
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, false, kNumChunks, TState>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, false, kNumChunks, TState>;
+  } else {
+    if (tma_stages == 3) {
+      return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3>
+                             : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3>;
+    }
+    if (tma_stages == 4) {
+      return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4>
+                             : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4>;
+    }
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL>;
   }
-  if (tma_stages == 4) {
-    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4>
-                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4>;
-  }
-  return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL>
-                         : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL>;
 }
 
 template <bool kUsePDL>
@@ -978,7 +1059,7 @@ struct KdaFusedDecodeKernel {
     // slot pitch from state.stride(0); only the inner [HV, V, K] contiguity
     // (strides {V*K, K, 1}) is load-bearing here.
     TensorMatcher({Slots_, kH, 128, 128})
-        .with_dtype<fp32_t>()
+        .with_dtype<fp32_t, bf16_t>()
         .with_device(device)
         .with_strides({-1, 128 * 128, 128, 1})
         .verify(state);
@@ -996,68 +1077,82 @@ struct KdaFusedDecodeKernel {
     // pools. Threaded into every ssm-state read/write; int64 avoids the
     // envelope-pitch overflow.
     const int64_t state_slot_stride = state.stride(0);
-    int tma_stages = 0;
-    // TMA 1D-bulk needs the per-slot source address (state + slot*stride) 16B
-    // aligned for every slot. state.data_ptr() is torch-aligned and each chunk
-    // offset is a multiple of kChunkV*kDimK*4 B, so alignment holds iff the slot
-    // pitch itself is 16B-aligned, i.e. state_slot_stride % 4 == 0 (fp32). The
-    // K3 envelope pitch (14,042,880 elems, %4==0) and the dense pitch both
-    // satisfy this; a pathological stride falls back to cp.async (still fully
-    // fused, just no TMA) rather than silently mis-addressing the descriptor.
-    const bool tma_slot_stride_aligned = (state_slot_stride % 4) == 0;
-    if (tma_slot_stride_aligned) {
-      // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
-      // is small enough that occupancy isn't the limiter; past that the
-      // 48KB 3-stage variant (one sync for the single stage reuse) benches
-      // fastest.
-      tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
-    }
-    auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
-                          : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
-                                     : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
-    const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
-    const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
-    host::RuntimeDeviceCheck(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    // Pool-dtype dispatch: fp32 pools run the original kernel (cp.async or TMA
+    // staging); bf16 pools run the TState=__nv_bfloat16 instantiation, which
+    // widens to fp32 on load and rounds back on store (TMA off).
+    auto launch = [&]<typename TState>() {
+      int tma_stages = 0;
+      // TMA 1D-bulk needs the per-slot source address (state + slot*stride) 16B
+      // aligned for every slot. state.data_ptr() is torch-aligned and each chunk
+      // offset is a multiple of kChunkV*kDimK*4 B, so alignment holds iff the slot
+      // pitch itself is 16B-aligned, i.e. state_slot_stride % 4 == 0 (fp32). The
+      // K3 envelope pitch (14,042,880 elems, %4==0) and the dense pitch both
+      // satisfy this; a pathological stride falls back to cp.async (still fully
+      // fused, just no TMA) rather than silently mis-addressing the descriptor.
+      // bf16 pools never take TMA: it moves raw bytes and cannot widen to fp32.
+      if constexpr (std::is_same_v<TState, float>) {
+        if ((state_slot_stride % 4) == 0) {
+          // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
+          // is small enough that occupancy isn't the limiter; past that the
+          // 48KB 3-stage variant (one sync for the single stage reuse) benches
+          // fastest.
+          tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
+        }
+      }
+      auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL, TState>(use_lower_bound, tma_stages)
+                            : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL, TState>(use_lower_bound, tma_stages)
+                                       : select_kda_fused_decode_k3_kernel<12, kUsePDL, TState>(use_lower_bound, tma_stages));
+      // Smem staging stays fp32 (the widening happens on the way in), so the
+      // footprint is identical for both pool dtypes.
+      const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
+      const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
+      host::RuntimeDeviceCheck(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
 
-    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)
-        .enable_pdl(kUsePDL)(
-            kernel,
-            /*x_q=*/mixed_ptr,
-            /*x_k=*/mixed_ptr + kSeg,
-            /*x_v=*/mixed_ptr + 2 * kSeg,
-            static_cast<const float*>(w_q_t.data_ptr()),
-            static_cast<const float*>(w_k_t.data_ptr()),
-            static_cast<const float*>(w_v_t.data_ptr()),
-            /*bias_q=*/bias_ptr,
-            /*bias_k=*/bias_ptr + kSeg,
-            /*bias_v=*/bias_ptr + 2 * kSeg,
-            /*cs_q=*/cs_ptr,
-            /*cs_k=*/cs_ptr + kSeg,
-            /*cs_v=*/cs_ptr + 2 * kSeg,
-            static_cast<const fp32_t*>(A_log.data_ptr()),
-            /*g=*/static_cast<const __nv_bfloat16*>(a.data_ptr()),
-            static_cast<const fp32_t*>(dt_bias.data_ptr()),
-            /*beta=*/static_cast<const __nv_bfloat16*>(b.data_ptr()),
-            static_cast<const __nv_bfloat16*>(onorm_g.data_ptr()),
-            static_cast<const fp32_t*>(onorm_weight.data_ptr()),
-            static_cast<const int32_t*>(indices.data_ptr()),
-            /*cu_seqlens=*/static_cast<const int32_t*>(nullptr),
-            static_cast<fp32_t*>(state.data_ptr()),
-            static_cast<__nv_bfloat16*>(out.data_ptr()),
-            B,
-            /*H=*/static_cast<int>(kH),
-            /*HV=*/static_cast<int>(kH),
-            static_cast<float>(lower_bound),
-            static_cast<float>(scale),
-            static_cast<float>(onorm_eps),
-            mixed_qkv.stride(0),
-            a.stride(0),
-            b.stride(0),
-            onorm_g.stride(0),
-            conv_states.stride(0),
-            conv_states.stride(1),
-            state_slot_stride);
+      LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)
+          .enable_pdl(kUsePDL)(
+              kernel,
+              /*x_q=*/mixed_ptr,
+              /*x_k=*/mixed_ptr + kSeg,
+              /*x_v=*/mixed_ptr + 2 * kSeg,
+              static_cast<const float*>(w_q_t.data_ptr()),
+              static_cast<const float*>(w_k_t.data_ptr()),
+              static_cast<const float*>(w_v_t.data_ptr()),
+              /*bias_q=*/bias_ptr,
+              /*bias_k=*/bias_ptr + kSeg,
+              /*bias_v=*/bias_ptr + 2 * kSeg,
+              /*cs_q=*/cs_ptr,
+              /*cs_k=*/cs_ptr + kSeg,
+              /*cs_v=*/cs_ptr + 2 * kSeg,
+              static_cast<const fp32_t*>(A_log.data_ptr()),
+              /*g=*/static_cast<const __nv_bfloat16*>(a.data_ptr()),
+              static_cast<const fp32_t*>(dt_bias.data_ptr()),
+              /*beta=*/static_cast<const __nv_bfloat16*>(b.data_ptr()),
+              static_cast<const __nv_bfloat16*>(onorm_g.data_ptr()),
+              static_cast<const fp32_t*>(onorm_weight.data_ptr()),
+              static_cast<const int32_t*>(indices.data_ptr()),
+              /*cu_seqlens=*/static_cast<const int32_t*>(nullptr),
+              static_cast<TState*>(state.data_ptr()),
+              static_cast<__nv_bfloat16*>(out.data_ptr()),
+              B,
+              /*H=*/static_cast<int>(kH),
+              /*HV=*/static_cast<int>(kH),
+              static_cast<float>(lower_bound),
+              static_cast<float>(scale),
+              static_cast<float>(onorm_eps),
+              mixed_qkv.stride(0),
+              a.stride(0),
+              b.stride(0),
+              onorm_g.stride(0),
+              conv_states.stride(0),
+              conv_states.stride(1),
+              state_slot_stride);
+    };
+    if (state.dtype().code == kDLBfloat && state.dtype().bits == 16) {
+      launch.template operator()<__nv_bfloat16>();
+    } else {
+      launch.template operator()<float>();
+    }
   }
 };
 

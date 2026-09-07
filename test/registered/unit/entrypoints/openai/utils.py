@@ -64,6 +64,7 @@ class MockTokenizerManager:
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()
+        self.abort_request = Mock()
 
     def config_value(self, name: str):
         """The value in effect for one config field."""

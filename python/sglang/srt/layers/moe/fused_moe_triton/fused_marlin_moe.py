@@ -192,7 +192,9 @@ def fused_marlin_moe(
     """
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    # NOTE: gating_output is unused below (routing is driven by topk_ids/topk_weights);
+    # its row count may legitimately differ from hidden_states under DP-attention
+    # gather, where router_logits stays local while hidden_states is gathered.
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (
         num_bits // 2

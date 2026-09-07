@@ -241,6 +241,11 @@ class ReqState:
     text: str = ""
     text_chunks: List[str] = dataclasses.field(default_factory=list)
 
+    # Set once the request has been dispatched to the scheduler; a teardown
+    # path must abort it engine-side before dropping the local state (see
+    # TokenizerManager._abort_dispatched_req_states).
+    dispatched: bool = False
+
     def append_text(self, chunk: str):
         if chunk:
             self.text_chunks.append(chunk)
@@ -829,9 +834,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
             # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
+            # request -- would otherwise leak those entries forever.
+            #
+            # Sub-requests that did reach the scheduler are aborted first: the
+            # scheduler keeps running them after the local state is dropped and
+            # would keep sending outputs for a deleted rid ("Received output ...
+            # but the state was deleted in TokenizerManager") until the request
+            # finishes on its own -- zombie generation on client disconnect.
+            self._abort_dispatched_req_states(obj)
+            # Entries already removed on the normal completion path are left
+            # untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
             raise
 
@@ -1570,6 +1582,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
             dispatched = True
+            state = self.rid_to_state.get(tokenized_obj.rid)
+            if state is not None:
+                state.dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -1604,6 +1619,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
+                state = self.rid_to_state.get(tokenized_obj.rid)
+                if state is not None:
+                    state.dispatched = True
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
         finally:
             if not dispatched:
@@ -2899,7 +2917,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
                     state.time_stats.get_interval(),
@@ -3439,6 +3457,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+
+    def _abort_dispatched_req_states(self, obj):
+        """Abort scheduler-side requests whose consumer is being torn down.
+
+        Must run BEFORE _discard_pending_req_states: abort_request
+        early-returns once the rid is gone from rid_to_state. Only requests
+        actually dispatched to the scheduler are aborted; the scheduler
+        no-ops aborts for rids it never saw, and requests that failed before
+        dispatch (e.g. input validation) are skipped via state.dispatched.
+        """
+        if not hasattr(obj, "is_single") or obj.is_single:
+            rids = [obj.rid]
+        else:
+            rids = obj.rid
+        for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is not None and state.dispatched:
+                try:
+                    self.abort_request(rid)
+                except Exception:
+                    logger.exception(f"Failed to abort {rid=} during teardown")
 
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.

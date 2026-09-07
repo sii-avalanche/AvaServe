@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_sglang_generate,
     calculate_metrics,
     set_global_args,
 )
@@ -121,6 +122,13 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 print_requests=False,
                 tokenizer="",
                 header=None,
+                temperature=0.0,
+                top_p=1.0,
+                return_logprob=False,
+                return_routed_experts=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
             )
         )
 
@@ -146,6 +154,32 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 extra_request_body={},
             )
             return asyncio.run(async_request_openai_chat_completions(req))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def _run_native(self, chunks):
+        port = _free_port()
+
+        class Handler(_SSEHandler):
+            pass
+
+        Handler.chunks = list(chunks)
+        server = HTTPServer(("127.0.0.1", port), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = RequestFuncInput(
+                prompt="hello",
+                api_url=f"http://127.0.0.1:{port}/generate",
+                prompt_len=1,
+                output_len=64,
+                model="dummy-model",
+                lora_name="",
+                image_data=None,
+                extra_request_body={},
+            )
+            return asyncio.run(async_request_sglang_generate(req))
         finally:
             server.shutdown()
             server.server_close()
@@ -223,6 +257,30 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertEqual(out.generated_text, "thinking")
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
+
+    def test_error_payload_in_successful_stream_is_reported(self):
+        chunks = [
+            _make_chunk(content="partial"),
+            {"error": {"message": "generation failed", "type": "server_error"}},
+        ]
+        out = self._run(chunks)
+
+        self.assertFalse(out.success)
+        self.assertEqual(out.error, "generation failed")
+        self.assertEqual(out.generated_text, "partial")
+        self.assertEqual(out.output_len, 0)
+
+    def test_native_error_payload_in_successful_stream_is_reported(self):
+        chunks = [
+            {"text": "partial", "meta_info": {"completion_tokens": 1}},
+            {"error": "native generation failed"},
+        ]
+        out = self._run_native(chunks)
+
+        self.assertFalse(out.success)
+        self.assertEqual(out.error, "native generation failed")
+        self.assertEqual(out.generated_text, "partial")
+        self.assertEqual(out.output_len, 0)
 
     def test_content_only_stream_unchanged(self):
         chunks = [

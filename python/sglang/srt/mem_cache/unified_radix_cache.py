@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -115,6 +116,11 @@ _COMPONENT_POOL_LABEL = {
     ComponentType.SWA: PoolName.SWA.value,
     ComponentType.MAMBA: PoolName.MAMBA.value,
 }
+
+# Fill value for other stages' digest pairs in the check_hicache_events
+# reduction tensor: far above the masked digest range (< 2^42), so the MIN
+# reduction keeps each stage's pair stage-local.
+_HICACHE_SYNC_PAD = 1 << 60
 
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
@@ -236,7 +242,24 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        # PP-sync sends posted by _pp_sync (the prefetch-terminate consensus
+        # path still uses it); reaped at each check_hicache_events round.
         self.work_list: list[torch.distributed.Work] = []
+        self.hicache_sync_group = params.hicache_sync_group
+        # In-flight ready-count reductions: one is posted per
+        # check_hicache_events round and reaped pp_size rounds later, so the
+        # cross-rank wait stays off the scheduling critical path even with a
+        # full loop iteration of pipeline skew between stages. Counts are
+        # cumulative (see _cum_ready_acks) so pops stay exactly-once no
+        # matter how many rounds a reduction remains in flight.
+        self._hicache_sync_inflight: deque[
+            tuple[torch.distributed.Work, torch.Tensor, tuple[PoolName, ...]]
+        ] = deque()
+        self._write_cum_counted = 0
+        self._write_cum_popped = 0
+        self._load_cum_counted = 0
+        self._load_cum_popped = 0
+        self._storage_cum_drained: list[int] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -359,6 +382,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # Reap in-flight ready-count reductions first: their counts refer to
+        # pre-reset queues and must not be applied afterwards. Every rank
+        # posted these works, so waiting on them cannot block.
+        for work, _, _ in self._hicache_sync_inflight:
+            work.wait()
+        self._hicache_sync_inflight.clear()
+        self._write_cum_counted = 0
+        self._write_cum_popped = 0
+        self._load_cum_counted = 0
+        self._load_cum_popped = 0
+        self._storage_cum_drained = []
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -2450,40 +2484,6 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_release()
         _drain_extra_release()
 
-    def drain_storage_control_queues(self) -> None:
-        cc = self.cache_controller
-        extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
-        extra_pool_names = list(extra_release_queues)
-        local_qsize_list = [
-            cc.prefetch_hit_queue.qsize(),
-            cc.ack_prefetch_queue.qsize(),
-            cc.ack_backup_queue.qsize(),
-            cc.host_mem_release_queue.qsize(),
-            *[
-                extra_release_queues[pool_name].qsize()
-                for pool_name in extra_pool_names
-            ],
-        ]
-        qsizes = torch.tensor(
-            local_qsize_list,
-            dtype=torch.int,
-        )
-        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
-        qsize_list = list(map(int, qsizes.tolist()))
-        n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
-        extra_release_counts = {
-            pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
-        }
-        self._drain_storage_control_queues_impl(
-            n_storage_hit=n_storage_hit,
-            n_ack_prefetch=n_ack_prefetch,
-            n_backup=n_backup,
-            n_release=n_release,
-            extra_release_counts=extra_release_counts,
-            log_metrics=True,
-        )
-
     def drain_storage_control_queues_local(self) -> None:
         """Drain the storage control queues without cross-rank synchronization.
 
@@ -2556,71 +2556,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
-    def _count_ready_acks(self, ack_queue) -> int:
-        ready_count = 0
-        for ack in ack_queue:
-            if not ack.finish_event.query():
-                break
-            ready_count += 1
-        return ready_count
+    @staticmethod
+    def _cum_ready_acks(ack_queue, cum_counted: int, cum_popped: int) -> int:
+        """Advance the cumulative count of ready acks (monotonic per rank).
 
-    def _sync_hicache_ready_counts(
-        self,
-    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
-        cc = self.cache_controller
-        if cc is None:
-            write_acks = 0
-            load_acks = 0
-            storage_queue_sizes = ()
-            extra_pool_names = ()
-        else:
-            write_acks = self._count_ready_acks(cc.ack_write_queue)
-            load_acks = self._count_ready_acks(cc.ack_load_queue)
-            extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
-            extra_pool_names = (
-                tuple(extra_release_queues) if self.enable_storage else ()
-            )
-            storage_queue_sizes = (
-                (
-                    cc.prefetch_hit_queue.qsize(),
-                    cc.ack_prefetch_queue.qsize(),
-                    cc.ack_backup_queue.qsize(),
-                    cc.host_mem_release_queue.qsize(),
-                    *(extra_release_queues[name].qsize() for name in extra_pool_names),
-                )
-                if self.enable_storage
-                else ()
-            )
 
-        # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
-        # equal iff reclaim victim order matched on every rank.
-        digest = self.tree_core.write_back_duplicate_reclaim_digest
-        ready_counts = torch.tensor(
-            [
-                write_acks,
-                load_acks,
-                *storage_queue_sizes,
-                digest,
-                -digest,
-            ],
-            dtype=torch.int64,
-            device="cpu",
-        )
-        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
-
-        count_values = list(map(int, ready_counts.tolist()))
-        assert (
-            count_values[-2] == -count_values[-1]
-        ), "write_back duplicate-reclaim victims diverged across TP ranks"
-        return (
-            count_values[0],
-            count_values[1],
-            tuple(count_values[2:-2]),
-            extra_pool_names,
-        )
+        Only the not-yet-counted tail is scanned: acks are popped from the
+        front, so the counted prefix currently spans cum_counted - cum_popped
+        entries.
+        """
+        counted = cum_counted - cum_popped
+        while counted < len(ack_queue) and ack_queue[counted].finish_event.query():
+            counted += 1
+        return cum_popped + counted
 
     def writing_check(
-        self, write_back: bool = False, finish_count: Optional[int] = None
+        self, write_back: bool = False, finish_count: int = 0
     ) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
@@ -2637,20 +2588,12 @@ class UnifiedRadixCache(BasePrefixCache):
                             self._finish_write_through_ack(ack_id)
                     self._log_write_ack_metrics(ack)
                 cc.ack_write_queue.clear()
+                # acks cleared above were finished by this flush; advance the
+                # popped watermark so a later lagged consume (whose posted
+                # target already counted them) does not pop them again.
+                self._write_cum_popped = self._write_cum_counted
                 assert len(self.ongoing_write_through) == 0
             return
-
-        if finish_count is None:
-            # Every rank must enter the all_reduce below; ongoing_write_through can
-            # diverge across ranks (e.g. write_backup returning 0 on a subset).
-            finish_count = 0
-            if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cc.ack_write_queue)
-            finish_count_tensor = torch.tensor(
-                finish_count, dtype=torch.int, device="cpu"
-            )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = finish_count_tensor.item()
 
         # Process completed acks
         while finish_count > 0:
@@ -2676,29 +2619,11 @@ class UnifiedRadixCache(BasePrefixCache):
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
             self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
-    def loading_check(self, finish_count: Optional[int] = None) -> None:
+    def loading_check(self, finish_count: int = 0) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
         if cc is None:
             return
-        if finish_count is None:
-            # Every rank must enter the all_reduce below; ongoing_load_back can
-            # diverge across ranks.
-            finish_count = 0
-            if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cc.ack_load_queue)
-            # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
-            # equal iff reclaim victim order matched on every rank.
-            digest = self.tree_core.write_back_duplicate_reclaim_digest
-            sync_tensor = torch.tensor(
-                [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
-            )
-            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = int(sync_tensor[0].item())
-            assert (
-                sync_tensor[1].item() == -sync_tensor[2].item()
-            ), "write_back duplicate-reclaim victims diverged across TP ranks"
-
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
@@ -2779,7 +2704,18 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+        """Called per scheduler step to poll async HiCache events.
+
+        Pop counts come from the MIN reduction posted pp_size rounds ago:
+        the reduction progresses in the background while the scheduler runs
+        and is reaped here before this round's is posted, so no cross-rank
+        wait sits on the scheduling critical path even with a full loop
+        iteration of pipeline skew between stages. The lag is conservative —
+        pops are completion-driven and only trail — and the reduction hands
+        every rank identical counts, which the replicated per-stage tree
+        metadata requires (letting each stage pop its own count would
+        diverge the replicas).
+        """
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -2804,52 +2740,75 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
-        if self.pp_size != 1:
-            finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")
-            if self.pp_rank == 0 and self.cache_controller is not None:
-                finish_counts[0] = self._count_ready_acks(
-                    self.cache_controller.ack_write_queue
-                )
-                finish_counts[1] = self._count_ready_acks(
-                    self.cache_controller.ack_load_queue
-                )
-            self._all_reduce(finish_counts, torch.distributed.ReduceOp.MIN)
-            write_finish_count, load_finish_count = map(int, finish_counts.tolist())
-            self.writing_check(finish_count=write_finish_count)
-            self.loading_check(finish_count=load_finish_count)
-            if self.enable_storage:
-                self.drain_storage_control_queues()
-        else:
-            (
-                write_finish_count,
-                load_finish_count,
-                storage_queue_sizes,
-                extra_pool_names,
-            ) = self._sync_hicache_ready_counts()
-            self.writing_check(finish_count=write_finish_count)
-            self.loading_check(finish_count=load_finish_count)
+        cc = self.cache_controller
+        if cc is None:
+            return
 
-            if self.enable_storage and storage_queue_sizes:
-                n_storage_hit, n_ack_prefetch, n_backup, n_release = (
-                    storage_queue_sizes[:4]
-                )
-                extra_release_counts = {
-                    pool_name: count
-                    for pool_name, count in zip(
-                        extra_pool_names,
-                        storage_queue_sizes[4:],
-                    )
-                }
-                self._drain_storage_control_queues_impl(
-                    n_storage_hit=n_storage_hit,
-                    n_ack_prefetch=n_ack_prefetch,
-                    n_backup=n_backup,
-                    n_release=n_release,
-                    extra_release_counts=extra_release_counts,
-                    log_metrics=True,
-                )
+        if len(self._hicache_sync_inflight) >= self.pp_size:
+            work, tensor, pool_names = self._hicache_sync_inflight.popleft()
+            work.wait()
+            self._apply_hicache_sync_counts(tensor.tolist(), pool_names)
+
+        extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+        extra_pool_names = (
+            tuple(extra_release_queues) if self.enable_storage else ()
+        )
+        if self.enable_storage:
+            storage_queues = (
+                cc.prefetch_hit_queue,
+                cc.ack_prefetch_queue,
+                cc.ack_backup_queue,
+                cc.host_mem_release_queue,
+                *(extra_release_queues[name] for name in extra_pool_names),
+            )
+            if len(self._storage_cum_drained) != len(storage_queues):
+                self._storage_cum_drained = [0] * len(storage_queues)
+            storage_sizes = tuple(
+                drained + q.qsize()
+                for drained, q in zip(self._storage_cum_drained, storage_queues)
+            )
+        else:
+            storage_sizes = ()
+
+        # The duplicate-reclaim digest is stage-local state, so each rank
+        # fills only its own stage's [digest, -digest] pair and the MIN
+        # reduction leaves other stages' pairs at the pad value.
+        digest_pairs = [_HICACHE_SYNC_PAD] * (2 * self.pp_size)
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        digest_pairs[2 * self.pp_rank] = digest
+        digest_pairs[2 * self.pp_rank + 1] = -digest
+        self._write_cum_counted = self._cum_ready_acks(
+            cc.ack_write_queue, self._write_cum_counted, self._write_cum_popped
+        )
+        self._load_cum_counted = self._cum_ready_acks(
+            cc.ack_load_queue, self._load_cum_counted, self._load_cum_popped
+        )
+        sync_tensor = torch.tensor(
+            [
+                self._write_cum_counted,
+                self._load_cum_counted,
+                *digest_pairs,
+                *storage_sizes,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._hicache_sync_inflight.append(
+            (
+                torch.distributed.all_reduce(
+                    sync_tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.hicache_sync_group,
+                    async_op=True,
+                ),
+                sync_tensor,
+                extra_pool_names,
+            )
+        )
+
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
+
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             storage_metrics = self.cache_controller.storage_backend.get_stats()
             if storage_metrics is None:
@@ -2858,6 +2817,44 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _apply_hicache_sync_counts(
+        self, counts: list[int], extra_pool_names: tuple[PoolName, ...]
+    ) -> None:
+        """Pop acks and drain storage queues with the reduced counts."""
+        # [digest, -digest] MIN-reduces to [min, -max] within each stage's
+        # pair; equal iff reclaim victim order matched on every rank.
+        digest_base = 2 + 2 * self.pp_rank
+        assert counts[digest_base] == -counts[digest_base + 1], (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
+        # The reduced targets are cumulative; pops are the delta over what
+        # earlier rounds already popped. The clamp covers the write-back
+        # flush path, which finishes counted acks out of band.
+        write_pops = max(0, counts[0] - self._write_cum_popped)
+        load_pops = max(0, counts[1] - self._load_cum_popped)
+        self.writing_check(finish_count=write_pops)
+        self.loading_check(finish_count=load_pops)
+        self._write_cum_popped += write_pops
+        self._load_cum_popped += load_pops
+        if self.enable_storage:
+            storage_targets = counts[2 + 2 * self.pp_size :]
+            drained = [
+                max(0, target - done)
+                for target, done in zip(storage_targets, self._storage_cum_drained)
+            ]
+            self._storage_cum_drained = [
+                done + n for done, n in zip(self._storage_cum_drained, drained)
+            ]
+            extra_release_counts = dict(zip(extra_pool_names, drained[4:]))
+            self._drain_storage_control_queues_impl(
+                n_storage_hit=drained[0],
+                n_ack_prefetch=drained[1],
+                n_backup=drained[2],
+                n_release=drained[3],
+                extra_release_counts=extra_release_counts,
+                log_metrics=True,
+            )
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
