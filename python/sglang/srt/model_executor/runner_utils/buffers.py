@@ -69,6 +69,7 @@ def _allocate_pp_proxy_tensors(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_dspark_num_layers: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Allocate the stable buffers consumed by an incoming PP proxy."""
     is_mhc = hc_hidden_size is not None
@@ -88,6 +89,13 @@ def _allocate_pp_proxy_tensors(
     if pp_proxy_topk_size is not None:
         pp_proxy_tensors["topk_indices"] = torch.zeros(
             (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
+        )
+    if pp_proxy_dspark_num_layers is not None:
+        # DSpark aux: [num_tokens, L, hidden], token-major to match the PP
+        # proxy buffer slice (buffer[:src.shape[0]] on dim 0).
+        pp_proxy_tensors["dspark_aux"] = torch.zeros(
+            (max_num_tokens, pp_proxy_dspark_num_layers, hidden_size),
+            dtype=dtype,
         )
     return pp_proxy_tensors
 
@@ -138,6 +146,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dspark_num_layers: Optional[int] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -170,6 +179,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     hc_hidden_size=hc_hidden_size,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                    pp_proxy_dspark_num_layers=pp_proxy_dspark_num_layers,
                 )
                 if pp_size > 1
                 else None
@@ -339,7 +349,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
+                # An upstream rank may not produce every key (e.g. dspark_aux
+                # only exists when that rank actually captures aux layers).
+                src = pp_proxy_tensors.tensors.get(key)
+                if src is None:
+                    continue
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
@@ -383,6 +397,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dspark_num_layers: Optional[int] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -419,6 +434,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
                     hc_hidden_size=hc_hidden_size,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                    pp_proxy_dspark_num_layers=pp_proxy_dspark_num_layers,
                 )
                 if pp_size > 1 and not is_first_pp_rank
                 else None

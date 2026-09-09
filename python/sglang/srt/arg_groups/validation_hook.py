@@ -50,8 +50,12 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         assert (
-            cfg.disable_overlap_schedule and cfg.speculative_algorithm is None
-        ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            cfg.disable_overlap_schedule
+            and (
+                cfg.speculative_algorithm is None
+                or cfg.speculative_algorithm == "DSPARK"
+            )
+        ), "Pipeline parallelism is not compatible with overlap schedule; only DSPARK speculative decoding is supported with pp_size > 1"
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "

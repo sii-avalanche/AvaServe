@@ -142,6 +142,7 @@ class RelayPayload:
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
     dsa_topk_indices: Optional[torch.Tensor] = None
+    pending_draft_tokens: Optional[torch.Tensor] = None
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
@@ -165,6 +166,7 @@ class RelayPayload:
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
+            pending_draft_tokens=getattr(draft_input, "pending_draft_tokens", None),
         )
 
 
@@ -304,6 +306,7 @@ class FutureMap:
         self.topk_p_buf = None
         self.topk_index_buf = None
         self.hidden_states_buf = None
+        self.pending_draft_tokens_buf = None
         self.draft_probs_buf = None
         self.dsa_topk_indices_buf = None
 
@@ -365,6 +368,16 @@ class FutureMap:
             self.draft_probs_buf = torch.empty(
                 (self.req_pool_size, *draft_probs0.shape),
                 dtype=draft_probs0.dtype,
+                device=self.device,
+            )
+
+        if self.pending_draft_tokens_buf is None and (
+            payload.pending_draft_tokens is not None
+        ):
+            pending0 = payload.pending_draft_tokens[0]
+            self.pending_draft_tokens_buf = torch.empty(
+                (self.req_pool_size, *pending0.shape),
+                dtype=pending0.dtype,
                 device=self.device,
             )
 
@@ -456,6 +469,13 @@ class FutureMap:
             draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
         else:
             draft_input.dsa_topk_indices = None
+        if (
+            self.pending_draft_tokens_buf is not None
+            and getattr(draft_input, "pending_draft_tokens", None) is not None
+        ):
+            draft_input.pending_draft_tokens = self.pending_draft_tokens_buf[
+                indices
+            ]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -622,6 +642,11 @@ class FutureMap:
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
+        if (
+            self.pending_draft_tokens_buf is not None
+            and payload.pending_draft_tokens is not None
+        ):
+            self.pending_draft_tokens_buf[indices] = payload.pending_draft_tokens
         if (
             self.dsa_topk_indices_buf is not None
             and payload.dsa_topk_indices is not None

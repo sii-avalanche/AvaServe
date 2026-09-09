@@ -382,9 +382,19 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
+        # The draft model is hosted only on the last PP stage; the other
+        # ranks run the target verify forward and consume the proposal
+        # relayed through the PP output ring.
+        if cfg.enable_dp_attention:
+            raise ValueError(
+                "DSpark speculative decoding with pp_size > 1 does not support "
+                "dp attention."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "DSpark speculative decoding with pp_size > 1 does not support "
+                "disaggregation."
+            )
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):

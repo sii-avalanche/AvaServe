@@ -76,6 +76,9 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    # On a non-last pipeline stage the target forward produces no logits;
+    # this carries the hidden-state proxies to relay to the next stage.
+    pp_proxy_tensors: object = None
 
 
 class TargetVerifyExecutor:
@@ -248,6 +251,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -277,9 +281,14 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        # Non-last pipeline stages get proxy tensors instead of logits; the
+        # adjustments only apply to real logits on the last stage.
+        if sampling_info is not None and isinstance(
+            result.logits_output, LogitsProcessorOutput
+        ):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -295,9 +304,10 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch, self.target_worker, pp_proxy_tensors=pp_proxy_tensors
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
@@ -307,10 +317,12 @@ class TargetVerifyExecutor:
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            pp_proxy_tensors=target_out.pp_hidden_states_proxy_tensors,
         )
 
     def commit_hidden(

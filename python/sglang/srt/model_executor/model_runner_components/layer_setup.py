@@ -199,6 +199,11 @@ def _assert_pp_mtp_compat(
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        # DSpark hosts the draft (MTP) model as a singleton-PP runner on the
+        # last PP stage; the target model's layer split across PP stages is
+        # fine because the aux-hidden capture layers (dspark_target_layer_ids,
+        # the trailing layers) live on that same stage.
+        or (spec_algorithm.is_dspark())
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)

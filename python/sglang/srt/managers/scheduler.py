@@ -1235,6 +1235,13 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        # Under PP + spec, prefill reqs run as EXTEND and decode reqs as
+        # TARGET_VERIFY, so they cannot be merged into a single MIXED batch.
+        assert not (
+            self.is_mixed_chunk
+            and self.ps.pp_size > 1
+            and not self.spec_algorithm.is_none()
+        ), "PP + spec-v2 does not support mixed-chunk prefill; disable --enable-mixed-chunk."
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (

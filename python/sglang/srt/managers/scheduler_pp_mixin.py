@@ -44,6 +44,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
 
@@ -1031,13 +1032,35 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        from sglang.srt.speculative.dflash_info_v2 import (
+            DFlashDraftInputV2,
+            DSparkPPRelayOutput,
+        )
+
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
+        if (
+            draft_input is not None
+            and draft_input.topk_p is not None
+            and not isinstance(draft_input, DFlashDraftInputV2)
+        ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+
+        # DSpark: the draft host packs the accept outcome + the next verify's
+        # proposal; the other ranks rebuild their spec_info from these.
+        if isinstance(draft_input, DFlashDraftInputV2):
+            tensor_dict.update(
+                DSparkPPRelayOutput(
+                    bonus_tokens=draft_input.bonus_tokens,
+                    new_seq_lens=draft_input.new_seq_lens,
+                    accept_lens=result.accept_lens,
+                    block_accept_lens=result.block_accept_lens,
+                    pending_draft_tokens=draft_input.pending_draft_tokens,
+                ).to_tensor_dict()
+            )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1209,31 +1232,85 @@ class SchedulerPPMixin:
             )
             batch.spec_info = next_draft_input
 
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices,
-            RelayPayload(
-                bonus_tokens=next_token_ids,
-                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
-                topk_index=(
-                    None if next_draft_input is None else next_draft_input.topk_index
+        # DSpark: rebuild the draft state + accept outcome from the ring.
+        accept_lens = None
+        block_accept_lens = None
+        new_seq_lens = None
+        if "dspark_relay/new_seq_lens" in pp_outputs.tensors:
+            from sglang.srt.speculative.dflash_info_v2 import (
+                DFlashDraftInputV2,
+                DSparkPPRelayOutput,
+            )
+
+            relay = DSparkPPRelayOutput.from_pp_outputs(pp_outputs)
+            new_seq_lens = relay.new_seq_lens.to(torch.int64)
+            batch.seq_lens = new_seq_lens
+            batch.seq_lens_cpu = new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            device = new_seq_lens.device
+            next_draft_input = DFlashDraftInputV2(
+                topk_p=torch.empty(
+                    (new_seq_lens.shape[0], 0), dtype=torch.float32, device=device
                 ),
-                hidden_states=(
-                    None if next_draft_input is None else next_draft_input.hidden_states
+                topk_index=torch.empty(
+                    (new_seq_lens.shape[0], 0), dtype=torch.int64, device=device
                 ),
-            ),
-        )
+                bonus_tokens=relay.bonus_tokens.to(torch.int64),
+                new_seq_lens=new_seq_lens,
+                hidden_states=torch.empty(
+                    (new_seq_lens.shape[0], 0), dtype=torch.float16, device=device
+                ),
+            )
+            if relay.pending_draft_tokens is not None:
+                next_draft_input.pending_draft_tokens = (
+                    relay.pending_draft_tokens.to(torch.int64)
+                )
+            worker_mask_token_id = getattr(
+                self.model_worker, "_mask_token_id", None
+            )
+            if worker_mask_token_id is not None:
+                next_draft_input.mask_token_id = worker_mask_token_id
+            batch.spec_info = next_draft_input
+            if relay.accept_lens is not None:
+                accept_lens = relay.accept_lens.to("cpu")
+            if relay.block_accept_lens is not None:
+                block_accept_lens = relay.block_accept_lens.to("cpu")
+
+        if next_draft_input is None:
+            # Non-spec PP: relay into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            # Spec-v2 rebuilds its inputs from the relayed spec_info instead,
+            # and PP + spec-v2 bans mixed-chunk prefill (see
+            # init_chunked_prefill), so spec batches never consume the stash.
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload(bonus_tokens=next_token_ids),
+            )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
-            next_token_ids=pp_outputs["next_token_ids"],
+            next_token_ids=(
+                # The spec-v2 result processor requires CPU tensors.
+                next_token_ids.to("cpu")
+                if next_draft_input is not None
+                else pp_outputs["next_token_ids"]
+            ),
+            accept_lens=accept_lens,
+            block_accept_lens=block_accept_lens,
             next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            speculative_num_draft_tokens=(
+                int(getattr(self.model_worker, "verify_num_draft_tokens"))
+                if next_draft_input is not None
+                and getattr(self.model_worker, "verify_num_draft_tokens", None)
+                is not None
+                else None
+            ),
+            new_seq_lens=new_seq_lens,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1312,9 +1389,17 @@ class SchedulerPPMixin:
         # adjacent pair has one sender and one receiver posted at the
         # same time.
 
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        if self.spec_algorithm in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            # PP+spec (EAGLE/DSpark): every rank sending first deadlocks
+            # on CUDA, so even ranks send first instead.
+            send_first = (self.ps.pp_rank % 2) == 0
+        else:
+            # CUDA: send first
+            # XPU: even ranks send first, odd ranks recv first.
+            send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1391,6 +1476,8 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                # The draft host keys its per-step sampling cache by this slot.
+                cur_batch.pp_mb_id = mb_id
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",

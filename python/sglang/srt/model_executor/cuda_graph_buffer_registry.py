@@ -751,7 +751,9 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # An upstream rank may not produce every key (e.g.
+                    # dspark_aux only exists when that rank captures layers).
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 

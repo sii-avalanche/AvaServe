@@ -1,8 +1,9 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import dataclasses
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 
 import torch
 
@@ -33,6 +34,40 @@ def _get_overlap_plan_stream(
 
 
 @dataclass
+class DSparkPPRelayOutput:
+    """DSpark PP relay envelope: the last rank's accept outcome + the next
+    verify's proposal, serialized through the PP output ring.
+
+    Adding a field here is the only change needed to relay new state:
+    to_tensor_dict/from_pp_outputs flatten and rebuild it generically."""
+
+    bonus_tokens: torch.Tensor  # [bs]
+    new_seq_lens: torch.Tensor  # [bs]
+    accept_lens: Optional[torch.Tensor] = None  # [bs]
+    block_accept_lens: Optional[torch.Tensor] = None  # [bs]
+    pending_draft_tokens: Optional[torch.Tensor] = None  # [bs, gamma]
+
+    _KEY_PREFIX: ClassVar[str] = "dspark_relay/"
+
+    def to_tensor_dict(self) -> dict:
+        return {
+            self._KEY_PREFIX + f.name: getattr(self, f.name).contiguous()
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) is not None
+        }
+
+    @classmethod
+    def from_pp_outputs(cls, pp_outputs) -> "DSparkPPRelayOutput":
+        tensors = pp_outputs.tensors
+        return cls(
+            **{
+                f.name: tensors.get(cls._KEY_PREFIX + f.name)
+                for f in dataclasses.fields(cls)
+            }
+        )
+
+
+@dataclass
 class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
 
@@ -46,6 +81,14 @@ class DFlashDraftInputV2(SpecInput):
     uniform_top_k_value: Optional[int] = None
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
+    # Pending draft proposal ([bs, gamma] token ids) for the next verify step.
+    # Produced by the draft-hosting rank at the end of the previous decode
+    # step and relayed across PP stages via the output ring; None means the
+    # next verify runs trivially (mask-token drafts, i.e. plain decode).
+    pending_draft_tokens: Optional[torch.Tensor] = None
+    # Token id used to pad missing rows of pending_draft_tokens on merge
+    # (drafts padded with it are never accepted).
+    mask_token_id: Optional[int] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -240,6 +283,8 @@ class DFlashDraftInputV2(SpecInput):
         self.bonus_tokens = self.bonus_tokens[new_indices]
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
+        if self.pending_draft_tokens is not None:
+            self.pending_draft_tokens = self.pending_draft_tokens[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
         if self.nxt_kv_lens_cpu is not None:
@@ -270,3 +315,34 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
+        mask_token_id = (
+            self.mask_token_id if self.mask_token_id is not None
+            else spec_info.mask_token_id
+        )
+        if mask_token_id is not None and (
+            self.pending_draft_tokens is not None
+            or spec_info.pending_draft_tokens is not None
+        ):
+            bs_self = self.bonus_tokens.shape[0]
+            bs_other = spec_info.bonus_tokens.shape[0]
+            gamma = (
+                self.pending_draft_tokens
+                if self.pending_draft_tokens is not None
+                else spec_info.pending_draft_tokens
+            ).shape[1]
+            self_pending = self.pending_draft_tokens
+            if self_pending is None:
+                self_pending = torch.full(
+                    (bs_self, gamma), mask_token_id, dtype=torch.long,
+                    device=self.bonus_tokens.device,
+                )
+            other_pending = spec_info.pending_draft_tokens
+            if other_pending is None:
+                other_pending = torch.full(
+                    (bs_other, gamma), mask_token_id, dtype=torch.long,
+                    device=self.bonus_tokens.device,
+                )
+            self.pending_draft_tokens = torch.cat([self_pending, other_pending], dim=0)
+        else:
+            self.pending_draft_tokens = None
+        self.mask_token_id = mask_token_id

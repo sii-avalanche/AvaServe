@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -245,11 +246,14 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = unwrap_lora_layer(
-            self.draft_model.embed_tokens
-            if not self.sample_from_anchor
-            else target_model.get_input_embeddings()
-        )
+        if not self.sample_from_anchor:
+            embed_module = unwrap_lora_layer(self.draft_model.embed_tokens)
+        else:
+            embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
+            if isinstance(embed_module, PPMissingLayer):
+                # A pipeline-parallel target keeps its embedding on the first
+                # stage; the last-stage draft uses its own loaded copy.
+                embed_module = unwrap_lora_layer(self.draft_model.embed_tokens)
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(

@@ -3093,10 +3093,25 @@ class DeepseekV4Model(nn.Module):
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
+        # Relay accumulated aux hidden states from upstream PP ranks. Each rank
+        # captures layers only in its own [start_layer, end_layer) range; the
+        # full aux list is rebuilt by concatenating upstream-relayed aux with
+        # local aux in PP-rank order, which matches the global layer order.
+        # PPProxyTensors only carries tensors, so aux is stacked as
+        # [num_tokens, L, hidden] and relayed under the "dspark_aux" key.
+        upstream_dspark_aux = None
+        if capture_dspark and pp_proxy_tensors is not None:
+            upstream_dspark_aux = pp_proxy_tensors.tensors.get("dspark_aux")
+        # Only layers in this rank's [start_layer, end_layer) range are
+        # captured locally; the rest arrive via the PP proxy relay.
+        local_capture = capture_dspark and any(
+            self.start_layer <= lid < self.end_layer
+            for lid in self.dspark_layers_to_capture
+        )
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        run_tbo = self._can_run_tbo(forward_batch) and not local_capture
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
@@ -3144,7 +3159,7 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
-                if capture_dspark and i in self.dspark_layers_to_capture:
+                if local_capture and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
                             hidden_states, prev_residual, prev_post, prev_comb
@@ -3182,7 +3197,18 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                # Relay aux: stack local captures and concat with upstream's
+                # [N, L_up, H] along the layer dim (upstream first, then local).
+                parts = []
+                if upstream_dspark_aux is not None:
+                    parts.append(upstream_dspark_aux)
+                if dspark_aux_hidden_states:
+                    parts.append(torch.stack(dspark_aux_hidden_states, dim=1))
+                if parts:
+                    proxy["dspark_aux"] = torch.cat(parts, dim=1)
+            return PPProxyTensors(proxy)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -3192,7 +3218,16 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            # Rebuild the full aux list in global layer order: upstream-relayed
+            # layers first, then this rank's own captures. upstream_dspark_aux
+            # is [N, L_up, H]; slice dim=1 to recover per-layer [N, H] tensors.
+            full_aux = list(dspark_aux_hidden_states)
+            if upstream_dspark_aux is not None:
+                full_aux = [
+                    upstream_dspark_aux[:, i, :]
+                    for i in range(upstream_dspark_aux.shape[1])
+                ] + full_aux
+            return (hidden_states, pre_hc_head), full_aux
 
         return hidden_states, pre_hc_head
 
@@ -3271,8 +3306,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."

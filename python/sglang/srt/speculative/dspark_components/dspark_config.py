@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -24,6 +26,26 @@ SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 # The dsv4 self-drafting checkpoint runs its draft attention on the dedicated
 # DeepSeek-V4 backend instead of the generic draft-backend fallback.
 DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
+
+_DRAFT_OWNS_EMBED_TOKENS: ContextVar[bool] = ContextVar(
+    "dspark_draft_owns_embed_tokens", default=False
+)
+
+
+@contextmanager
+def dspark_draft_own_embed_tokens_scope():
+    """Brackets a DSpark draft build whose target's embedding lives on a
+    remote pipeline stage: the draft creates and loads its own embed_tokens
+    instead of sharing the target's."""
+    token = _DRAFT_OWNS_EMBED_TOKENS.set(True)
+    try:
+        yield
+    finally:
+        _DRAFT_OWNS_EMBED_TOKENS.reset(token)
+
+
+def draft_owns_embed_tokens() -> bool:
+    return _DRAFT_OWNS_EMBED_TOKENS.get()
 
 
 def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:

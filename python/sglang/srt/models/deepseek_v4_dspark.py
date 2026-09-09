@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    draft_owns_embed_tokens,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -750,13 +751,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
 
-        if self.uses_own_vocab_modules:
+        # The target's embedding lives on the first pipeline stage; a draft
+        # hosted on the last stage creates and loads its own copy instead of
+        # sharing it (the lm_head stays shared: it sits on the last stage).
+        if self.uses_own_vocab_modules or draft_owns_embed_tokens():
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=add_prefix("embed_tokens", prefix),
                 enable_tp=not is_dp_attention_enabled(),
             )
+        else:
+            self.embed_tokens: Optional[nn.Module] = None
+        if self.uses_own_vocab_modules:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -764,7 +771,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
-            self.embed_tokens: Optional[nn.Module] = None
             self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
@@ -779,7 +785,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
         if not self.uses_own_vocab_modules:
-            self.embed_tokens = embed_tokens
+            # A draft that loaded its own embedding (remote target embedding
+            # under pipeline parallelism) keeps it; otherwise share the
+            # target's.
+            if self.embed_tokens is None:
+                self.embed_tokens = embed_tokens
             self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
@@ -1006,6 +1016,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+            # A draft hosting its own embedding (pipeline-parallel target)
+            # loads the main checkpoint's embedding table.
+            if name == "embed.weight" and self.embed_tokens is not None:
+                return "embed_tokens.weight"
             return None
         if "rotary_emb.inv_freq" in name:
             return None

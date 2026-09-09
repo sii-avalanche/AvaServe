@@ -60,6 +60,7 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        pp_proxy_tensors=None,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -67,6 +68,10 @@ class DFlashVerifyInput(SpecInput):
         method is called. GPU keeps the original pre-planning path. NPU leaves
         attention/graph metadata initialization to ModelRunner because DP/EP
         padding can still change the compressor's runtime shapes.
+
+        ``pp_proxy_tensors`` must reach the graph-runner load_batch HERE:
+        this pre-planning call initializes the metadata, so the runner's
+        execute-time load_batch early-returns and would silently drop them.
         """
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
@@ -115,7 +120,7 @@ class DFlashVerifyInput(SpecInput):
             return verify_forward_batch, can_run_cuda_graph
         elif can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
+                verify_forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
