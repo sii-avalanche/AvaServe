@@ -547,7 +547,6 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
     receiver.tp_worker = SimpleNamespace(
         model_runner=SimpleNamespace(sampling_observer=observer)
     )
-    receiver.future_map = SimpleNamespace(stash=Mock())
 
     output_result = Scheduler._pp_prep_batch_result(
         receiver,
@@ -561,7 +560,6 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
     assert output_result.logits_output.auxiliary_device_output is not device_output
     assert torch.equal(output_result.auxiliary_host_output.values, device_output.values)
     assert all("sampling_observer_output" not in key for key in tensors)
-    receiver.future_map.stash.assert_called_once()
 
 
 def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
@@ -583,7 +581,6 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
     )
     receiver = object.__new__(Scheduler)
     receiver.pp_group = SimpleNamespace(is_first_rank=False)
-    receiver.future_map = SimpleNamespace(stash=Mock())
 
     output_result = Scheduler._pp_prep_batch_result(
         receiver,

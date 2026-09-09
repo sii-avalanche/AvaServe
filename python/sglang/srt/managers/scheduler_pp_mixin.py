@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -25,9 +25,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.pp_output_relay import MB_SLOT_KEY, PPOutputRelay
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
+    _async_d2h,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
@@ -44,9 +46,8 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module
 
 logger = logging.getLogger(__name__)
 
@@ -84,14 +85,13 @@ class SchedulerPPMixin:
         Unified Schedule:
         ====================================================================
         Stage P
+        join the output of this slot's previous-round batch (relayed off the
+          critical path by the PP output relay worker, see pp_output_relay.py)
         recv ith req from previous stage
         recv ith proxy from previous stage
         run ith batch
-        recv prev (i+1)% mb_size th outputs
-        process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
         send ith proxy to next stage
-        send current stage's outputs to next stage(can be stashed and delayed to send later)
 
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
 
@@ -101,10 +101,13 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # Finalize the output of the batch that ran in this slot on
+                # the previous round, before it can be rescheduled below. The
+                # relay worker has done the transport + preprocessing off the
+                # critical path, so this join is effectively non-blocking.
+                self._pp_join_output_relay(mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
-                next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -117,16 +120,6 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                next_pp_outputs = None
-                next_batch_result = None
-                d2h_event = None
-                if get_parallel().pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -134,7 +127,6 @@ class SchedulerPPMixin:
                         cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
-                        self.last_rank_comm_queue,
                     )
                 # Receive + fan out requests while the just-launched batch runs
                 # on the GPU, instead of leaving this CPU work in the GPU-idle
@@ -150,21 +142,6 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
-                if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -178,8 +155,6 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                             )
-
-                self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -239,16 +214,16 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # See event_loop_pp: finalize this slot's previous-round
+                # output before rescheduling it.
+                self._pp_join_output_relay(mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
-                next_pp_outputs = None
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
-                d2h_event = None
-                next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
@@ -280,13 +255,6 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                if get_parallel().pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
                     if self.enable_staging:
@@ -296,14 +264,6 @@ class SchedulerPPMixin:
                         cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
-                if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
                     )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
@@ -330,14 +290,6 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
-                # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
-                        next_batch_result,
-                    )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -361,7 +313,6 @@ class SchedulerPPMixin:
                             msg_type="proxy",
                         )
 
-                self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
@@ -392,17 +343,17 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # See event_loop_pp: finalize this slot's previous-round
+                # output before rescheduling it.
+                self._pp_join_output_relay(mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
-                next_pp_outputs = None
                 next_consensus_retract_rids = None
                 next_consensus_prealloc_rids = None
                 next_release_rids = None
-                d2h_event = None
-                next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
@@ -440,14 +391,6 @@ class SchedulerPPMixin:
                     if not cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # early send output if possible
-                if get_parallel().pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
-                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
                 if cur_batch:
@@ -456,15 +399,6 @@ class SchedulerPPMixin:
                         cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
-
-                if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
-                        )
                     )
 
                 # reach consensus on last rank and send to PP=0
@@ -517,16 +451,6 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(send_release_work)
 
-                # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -550,7 +474,6 @@ class SchedulerPPMixin:
                             msg_type="proxy",
                         )
 
-                self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
@@ -582,24 +505,22 @@ class SchedulerPPMixin:
             for _ in range(self.pp_loop_size)
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
-        self.pp_outputs: Optional[PPProxyTensors] = None
-        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
-        # (last rank) own (launch_event, outputs) keyed by microbatch slot,
-        # consumed locally in place of receiving them back around the PP ring
-        # (see _do_recv).
-        self._pp_local_output_proxies: List[
-            Optional[Tuple[torch.Event, PPProxyTensors]]
-        ] = [
-            None
-        ] * self.pp_loop_size
+        # Batches launched in each slot on the previous round, awaiting the
+        # output-relay join at the top of the slot's next iteration.
+        self._pp_ran_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_loop_size
 
         self.send_req_work = []
         self.send_proxy_work = []
-        self.send_output_work = []
         self.launch_event = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        if getattr(self, "pp_output_relay", None) is None:
+            self.pp_output_relay = PPOutputRelay(
+                pp_group=self.pp_group,
+                loop_size=self.pp_loop_size,
+                prep_result=self._pp_prep_batch_result,
+            )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -951,31 +872,6 @@ class SchedulerPPMixin:
             p2p_work.work.wait()
         work.clear()
 
-    def _pp_commit_send_output_work_and_preprocess_output_tensors(
-        self: Scheduler,
-        next_first_rank_mb_id: int,
-        next_mb_id: int,
-    ) -> Tuple[
-        Optional[PPProxyTensors],
-        Optional[GenerationBatchResult],
-        Optional[torch.Event],
-    ]:
-        self._pp_commit_comm_work(work=self.send_output_work)
-        (
-            next_pp_outputs,
-            next_batch_result,
-            d2h_event,
-            self.send_output_work,
-        ) = self._pp_send_recv_and_preprocess_output_tensors(
-            next_first_rank_mb_id,
-            next_mb_id,
-            self.mbs,
-            self.mb_metadata,
-            self.last_rank_comm_queue,
-            self.pp_outputs,
-        )
-        return next_pp_outputs, next_batch_result, d2h_event
-
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -1050,7 +946,8 @@ class SchedulerPPMixin:
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
 
         # DSpark: the draft host packs the accept outcome + the next verify's
-        # proposal; the other ranks rebuild their spec_info from these.
+        # proposal; the other ranks rebuild their spec_info from these (see
+        # pp_output_relay.py for the transport).
         if isinstance(draft_input, DFlashDraftInputV2):
             tensor_dict.update(
                 DSparkPPRelayOutput(
@@ -1153,27 +1050,17 @@ class SchedulerPPMixin:
             )
         return pp_proxy_tensors
 
-    def _pp_recv_dict_from_prev_stage(
-        self: Scheduler,
-    ) -> Dict[str, torch.Tensor]:
-        return self._pp_recv_typed_dict(
-            expected_kind="output",
-            all_gather_group=(
-                self.attn_tp_group if self.require_attn_tp_allgather else None
-            ),
-        )
-
     def _pp_make_skip_output_result(
         self: Scheduler,
         batch: ScheduleBatch,
         mb_metadata: Optional[PPBatchMetadata],
-    ):
+    ) -> GenerationBatchResult:
         bs = len(batch.reqs)
-        placeholder = torch.zeros(bs, dtype=torch.int64, device=self.device)
-        # next_pp_outputs = None so non-last ranks skip forwarding
-        # (pp_outputs is None gate). Placeholder carried in
-        # batch_result.next_token_ids for process_batch_result_prefill.
-        batch_result = GenerationBatchResult(
+        # Placeholder carried in batch_result.next_token_ids for
+        # process_batch_result_prefill; skipped_output_comm marks it so the
+        # validator asserts the placeholder is never consumed.
+        placeholder = torch.zeros(bs, dtype=torch.int64)
+        return GenerationBatchResult(
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=placeholder,
@@ -1182,9 +1069,6 @@ class SchedulerPPMixin:
             ),
             skipped_output_comm=True,
         )
-        d2h_event = self.device_module.Event()
-        d2h_event.record(self.device_module.current_stream())
-        return None, batch_result, d2h_event
 
     def _pp_prep_batch_result(
         self: Scheduler,
@@ -1192,6 +1076,15 @@ class SchedulerPPMixin:
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
     ):
+        """Build the GenerationBatchResult from the relayed output tensors.
+
+        Called from the PP output relay worker thread with CPU tensors (gloo
+        is a host transport), so this must stay pure host code: it may only
+        touch the retired ``batch`` object and read-only scheduler state.
+        Device hoisting of the speculative state and the non-spec future_map
+        stash happen later on the scheduler thread at the join point (see
+        _pp_join_output_relay).
+        """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
         logits_output = None
@@ -1216,8 +1109,8 @@ class SchedulerPPMixin:
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
-        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
-        # processor sees the same object on every rank.
+        # Rebind the last stage's relayed proposal as batch.spec_info so the
+        # result processor sees the same object on every rank.
         next_draft_input = None
         if "draft_topk_p" in pp_outputs.tensors:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -1232,7 +1125,7 @@ class SchedulerPPMixin:
             )
             batch.spec_info = next_draft_input
 
-        # DSpark: rebuild the draft state + accept outcome from the ring.
+        # DSpark: rebuild the draft state + accept outcome from the relay.
         accept_lens = None
         block_accept_lens = None
         new_seq_lens = None
@@ -1262,12 +1155,10 @@ class SchedulerPPMixin:
                 ),
             )
             if relay.pending_draft_tokens is not None:
-                next_draft_input.pending_draft_tokens = (
-                    relay.pending_draft_tokens.to(torch.int64)
+                next_draft_input.pending_draft_tokens = relay.pending_draft_tokens.to(
+                    torch.int64
                 )
-            worker_mask_token_id = getattr(
-                self.model_worker, "_mask_token_id", None
-            )
+            worker_mask_token_id = getattr(self.model_worker, "_mask_token_id", None)
             if worker_mask_token_id is not None:
                 next_draft_input.mask_token_id = worker_mask_token_id
             batch.spec_info = next_draft_input
@@ -1276,17 +1167,6 @@ class SchedulerPPMixin:
             if relay.block_accept_lens is not None:
                 block_accept_lens = relay.block_accept_lens.to("cpu")
 
-        if next_draft_input is None:
-            # Non-spec PP: relay into output_tokens_buf so the next iter's
-            # resolve_forward_inputs finds these tokens for the decode portion
-            # of mixed-chunk batches (which gather via mix_running_indices).
-            # Spec-v2 rebuilds its inputs from the relayed spec_info instead,
-            # and PP + spec-v2 bans mixed-chunk prefill (see
-            # init_chunked_prefill), so spec batches never consume the stash.
-            self.future_map.stash(
-                batch.req_pool_indices,
-                RelayPayload(bonus_tokens=next_token_ids),
-            )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1320,150 +1200,69 @@ class SchedulerPPMixin:
     ):
         self.process_batch_result(batch, output_result)
 
-    def _pp_send_output_to_next_stage(
-        self: Scheduler,
-        next_first_rank_mb_id: int,
-        mbs: List[ScheduleBatch],
-        last_rank_comm_queue: deque,
-        pp_outputs: PPProxyTensors | None,
-    ) -> List[P2PWork]:
-        send_output_work = []
-        if self.pp_group.is_last_rank:
-            # send ready PP output to rank 0
-            target = mbs[next_first_rank_mb_id]
-            if target is not None:
-                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
-                ):
-                    self.device_module.current_stream().wait_event(q_event)
-                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                        send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
-                            async_send=True,
-                            msg_type="output",
+    def _pp_join_output_relay(self: Scheduler, mb_id: int) -> None:
+        """Finalize the output of the batch that ran in this slot last round.
+
+        The relay worker has already done the transport and the result
+        preprocessing off the critical path (see pp_output_relay.py), so what
+        remains here is device hoisting plus the scheduler-state processing,
+        all pure host work with no GPU waits. Runs one full pipeline round
+        after the batch launched, which gives the worker enough slack that
+        the join effectively never blocks.
+        """
+        batch = self._pp_ran_mbs[mb_id]
+        if batch is None:
+            return
+        self._pp_ran_mbs[mb_id] = None
+        batch, result = self.pp_output_relay.join(mb_id)
+        if result is not None:
+            self._pp_hoist_relay_result_to_device(batch, result)
+            if result.next_draft_input is None and not result.skipped_output_comm:
+                # Non-spec PP: relay into output_tokens_buf so the next iter's
+                # resolve_forward_inputs finds these tokens for the decode
+                # portion of mixed-chunk batches (which gather via
+                # mix_running_indices). Spec-v2 rebuilds its inputs from the
+                # relayed spec_info instead, and PP + spec-v2 bans mixed-chunk
+                # prefill (see init_chunked_prefill), so spec batches never
+                # consume the stash.
+                self.future_map.stash(
+                    batch.req_pool_indices,
+                    RelayPayload(
+                        bonus_tokens=result.next_token_ids.to(torch.int64).to(
+                            self.device, non_blocking=True
                         )
-        # send the outputs from the last round to let the next stage worker run post processing
-        if not self.pp_group.is_last_rank:
-            # The relay stops at pp_size-2 for any pp_size: outputs only need
-            # to reach ranks 0..pp_size-2 (rank 0 needs the tokens for
-            # embedding, the rest for bookkeeping). The last rank consumes its
-            # own outputs from the local stash (see _do_recv), so the final
-            # hop back to the data's origin is pure echo. pp_size == 2 is the
-            # special case where rank 0 does not relay at all.
-            if self.ps.pp_rank < self.ps.pp_size - 2 and pp_outputs:
-                with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                    send_output_work = self._pp_send_dict_to_next_stage(
-                        pp_outputs.tensors,
-                        async_send=True,
-                        msg_type="output",
-                    )
-        return send_output_work
+                    ),
+                )
+            with torch.profiler.record_function("process_batch_result"):
+                self._pp_process_batch_result(batch, result)
+        self.last_mbs[mb_id] = batch
 
-    def _pp_send_recv_and_preprocess_output_tensors(
-        self: Scheduler,
-        next_first_rank_mb_id: int,
-        next_mb_id: int,
-        mbs: List[ScheduleBatch],
-        mb_metadata: List[PPBatchMetadata],
-        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
-        pp_outputs: PPProxyTensors | None,
-    ) -> Tuple[
-        Optional[PPProxyTensors],
-        Optional[GenerationBatchResult],
-        Optional[torch.Event],
-        List[P2PWork],
-    ]:
-        next_pp_outputs = None
-        d2h_event = None
-        batch_result = None
-        send_output_work = []
+    def _pp_hoist_relay_result_to_device(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Move the relayed speculative state back to the device.
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        if self.spec_algorithm in (
-            SpeculativeAlgorithm.EAGLE,
-            SpeculativeAlgorithm.DSPARK,
+        The relay delivers CPU tensors (gloo is a host transport); downstream
+        verify/draft preparation expects the spec state on-device, mirroring
+        what the NCCL transport used to deliver.
+        """
+        draft_input = result.next_draft_input
+        if draft_input is None:
+            return
+        for attr in (
+            "bonus_tokens",
+            "new_seq_lens",
+            "pending_draft_tokens",
+            "topk_p",
+            "topk_index",
+            "hidden_states",
         ):
-            # PP+spec (EAGLE/DSpark): every rank sending first deadlocks
-            # on CUDA, so even ranks send first instead.
-            send_first = (self.ps.pp_rank % 2) == 0
-        else:
-            # CUDA: send first
-            # XPU: even ranks send first, odd ranks recv first.
-            send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
-
-        def _do_send():
-            return self._pp_send_output_to_next_stage(
-                next_first_rank_mb_id,
-                mbs,
-                last_rank_comm_queue,
-                pp_outputs,
-            )
-
-        def _do_recv():
-            nonlocal next_pp_outputs, batch_result, d2h_event
-            target = mbs[next_mb_id]
-            if target is None or target.forward_mode.is_prebuilt():
-                return
-            if _pp_can_skip_output_comm(target):
-                next_pp_outputs, batch_result, d2h_event = (
-                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
-                )
-                return
-            if self.pp_group.is_last_rank:
-                # The outputs were produced by this rank; consume the copy
-                # stashed at launch time instead of receiving them back around
-                # the ring. Values are identical (sampling is replicated
-                # across the TP group), only the transport is skipped.
-                stashed = self._pp_local_output_proxies[next_mb_id]
-                assert stashed is not None
-                produce_event, next_pp_outputs = stashed
-            else:
-                if self.launch_event is not None:
-                    # Post the recv only after the just-launched forward
-                    # completes: ProcessGroupNCCL syncs its internal p2p
-                    # stream with the current stream (syncStream), so the
-                    # NCCL recv kernel only becomes device-resident then.
-                    # Otherwise the resident recv kernel conflicts with the
-                    # flashinfer MLA decode kernels in the decode graph:
-                    # they are cooperative launches requiring the whole
-                    # device (all SMs) co-resident, and stall mid-graph
-                    # until the recv kernel completes.
-                    torch.cuda.current_stream().wait_event(self.launch_event)
-                with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                    next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
-                    )
-                produce_event = None
-            with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.schedule_stream)
-                if produce_event is not None:
-                    # Order the read of the stashed tensors after the forward
-                    # (sampling) that produced them.
-                    self.copy_stream.wait_event(produce_event)
-                batch_result = self._pp_prep_batch_result(
-                    target, mb_metadata[next_mb_id], next_pp_outputs
-                )
-                d2h_event = self.device_module.Event()
-                d2h_event.record(self.device_module.current_stream())
-
-        if send_first:
-            send_output_work = _do_send()
-            _do_recv()
-        else:
-            _do_recv()
-            send_output_work = _do_send()
-
-        return next_pp_outputs, batch_result, d2h_event, send_output_work
+            value = getattr(draft_input, attr, None)
+            if torch.is_tensor(value) and value.is_cpu:
+                setattr(draft_input, attr, value.to(self.device, non_blocking=True))
+        if result.new_seq_lens is not None:
+            # _pp_prep_batch_result rebound these to the relayed CPU copies.
+            batch.seq_lens = result.new_seq_lens.to(self.device, non_blocking=True)
 
     def _pp_launch_batch(
         self: Scheduler,
@@ -1471,8 +1270,8 @@ class SchedulerPPMixin:
         cur_batch: ScheduleBatch,
         pp_proxy_tensors: PPProxyTensors,
         mb_metadata: List[Optional[PPBatchMetadata]],
-        last_rank_comm_queue: deque,
     ):
+        relay_tensors = None
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
@@ -1495,16 +1294,48 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
-                if self.pp_group.is_last_rank:
-                    # (last rank) buffer the outputs for async batch depth
-                    proxy = PPProxyTensors(
-                        self._pp_prepare_tensor_dict(result, cur_batch)
-                    )
-                    last_rank_comm_queue.append((event, proxy))
-                    # The outputs originate from this rank; keep a local copy
-                    # so the output processing of this microbatch can read it
-                    # directly instead of receiving it back around the PP ring.
-                    self._pp_local_output_proxies[mb_id] = (event, proxy)
+                if (
+                    self.pp_group.is_last_rank
+                    and not cur_batch.forward_mode.is_prebuilt()
+                    and not _pp_can_skip_output_comm(cur_batch)
+                ):
+                    # Pack on the forward stream so the tensors are ordered
+                    # after the forward (sampling) that produced them.
+                    relay_tensors = self._pp_prepare_tensor_dict(result, cur_batch)
+                    relay_tensors[MB_SLOT_KEY] = mb_id
+
+        # Hand the slot's output-return to the relay (see pp_output_relay.py);
+        # the result is joined at the top of this slot's next iteration.
+        self._pp_ran_mbs[mb_id] = cur_batch
+        if cur_batch.forward_mode.is_prebuilt():
+            # Prebuilt batches produce no outputs; the join only refreshes the
+            # last-batch bookkeeping.
+            self.pp_output_relay.post_local(mb_id, cur_batch, None)
+        elif _pp_can_skip_output_comm(cur_batch):
+            self.pp_output_relay.post_local(
+                mb_id,
+                cur_batch,
+                self._pp_make_skip_output_result(cur_batch, mb_metadata[mb_id]),
+            )
+        elif self.pp_group.is_last_rank:
+            # Stage the outputs to pinned host memory with an async D2H on the
+            # copy stream; the relay worker fans them out over gloo once the
+            # copy drains. No GPU kernel is ever posted for the output return
+            # path, so nothing can go device-resident and stall the
+            # cooperative decode kernels in the next CUDA graph.
+            with self.copy_stream_ctx:
+                self.copy_stream.wait_event(event)
+                staged_tensors = {
+                    k: _async_d2h(v) if torch.is_tensor(v) else v
+                    for k, v in relay_tensors.items()
+                }
+                d2h_done = self.device_module.Event()
+                d2h_done.record(self.device_module.current_stream())
+            self.pp_output_relay.submit_send(
+                mb_id, d2h_done, staged_tensors, cur_batch, mb_metadata[mb_id]
+            )
+        else:
+            self.pp_output_relay.expect_message(mb_id, cur_batch, mb_metadata[mb_id])
         return result, event
 
     def get_rids(

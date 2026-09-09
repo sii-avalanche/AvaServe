@@ -270,6 +270,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    _async_d2h,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -3338,6 +3339,8 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        self._resolve_pending_seq_lens_cpu(running_batch)
+        self._resolve_pending_seq_lens_cpu(last_batch)
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3508,6 +3511,7 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        self._resolve_pending_seq_lens_cpu(running_batch)
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Decay the max-prefill-bs high-watermark once per pass so one
@@ -4030,6 +4034,30 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _stage_seq_lens_cpu_update(
+        self, batch: ScheduleBatch, new_seq_lens: torch.Tensor
+    ) -> None:
+        """Enqueue an async D2H of new_seq_lens (ordered after the forward on
+        the current stream) and park it on the batch for lazy resolution."""
+        cpu_mirror = _async_d2h(new_seq_lens)
+        done_event = self.device_module.Event()
+        done_event.record(self.device_module.current_stream())
+        batch.pending_seq_lens_cpu = (cpu_mirror, done_event)
+
+    def _resolve_pending_seq_lens_cpu(self, batch: Optional[ScheduleBatch]) -> None:
+        """Materialize a staged seq_lens CPU mirror before the batch is
+        scheduled again. No-op unless a previous run_batch staged one."""
+        if batch is None:
+            return
+        pending = getattr(batch, "pending_seq_lens_cpu", None)
+        if pending is None:
+            return
+        batch.pending_seq_lens_cpu = None
+        cpu_mirror, done_event = pending
+        done_event.synchronize()
+        batch.seq_lens_cpu = cpu_mirror
+        batch.seq_lens_sum = int(cpu_mirror.sum())
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -4180,8 +4208,13 @@ class Scheduler(
                 if batch_result.new_seq_lens is not None:
                     batch.seq_lens = batch_result.new_seq_lens
                     if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                        # Stage the CPU-mirror update as an async D2H instead
+                        # of blocking this return path on the just-launched
+                        # forward; it is resolved lazily before the batch's
+                        # next scheduling round (see _resolve_pending_seq_lens_cpu).
+                        self._stage_seq_lens_cpu_update(
+                            batch, batch_result.new_seq_lens
+                        )
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Only the last PP rank owns real results requiring D2H; other ranks
