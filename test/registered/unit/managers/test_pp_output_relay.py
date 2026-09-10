@@ -30,11 +30,16 @@ def _make_pp_group(*, is_last_rank: bool, world_size: int = 3):
 def test_send_side_fans_out_and_posts_local_result():
     pp_group = _make_pp_group(is_last_rank=True, world_size=3)
     sent_snapshots = []
-    pp_group.send_tensor_dict = Mock(
-        side_effect=lambda tensor_dict, dst: sent_snapshots.append(
-            (dst, dict(tensor_dict))
-        )
-    )
+    fake_works = []
+
+    def fake_send_tensor_dict(tensor_dict, dst, async_send=False):
+        assert async_send
+        sent_snapshots.append((dst, dict(tensor_dict)))
+        work = SimpleNamespace(work=Mock())
+        fake_works.append(work)
+        return [work]
+
+    pp_group.send_tensor_dict = Mock(side_effect=fake_send_tensor_dict)
     prep_result = Mock(return_value="prepped")
     relay = PPOutputRelay(pp_group=pp_group, loop_size=2, prep_result=prep_result)
 
@@ -48,8 +53,12 @@ def test_send_side_fans_out_and_posts_local_result():
     assert joined_batch is batch
     assert joined_result == "prepped"
     d2h_done.synchronize.assert_called_once()
-    # Fan-out to every earlier stage, no ring relay.
+    # Fan-out to every earlier stage in parallel, no ring relay; every async
+    # send is awaited before the job completes.
     assert [dst for dst, _ in sent_snapshots] == [0, 1]
+    assert len(fake_works) == 2
+    for work in fake_works:
+        work.work.wait.assert_called_once()
     assert all(snap[MB_SLOT_KEY] == 1 for _, snap in sent_snapshots)
     # Local preprocessing sees the same tensors minus the slot key.
     prepped_tensors = prep_result.call_args.args[2].tensors

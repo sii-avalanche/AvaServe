@@ -53,13 +53,17 @@ logger = logging.getLogger(__name__)
 _REQ_FORWARD_TAG = 20260909
 
 
-def _send_bytes(
+def _isend_bytes(
     group, dst_global_rank: int, payload: bytes, tag: int = _REQ_FORWARD_TAG
-) -> None:
+) -> List[Tuple[Any, torch.Tensor]]:
+    """Issue the two-part message as async sends; the returned (work, tensor)
+    pairs keep the buffers alive until the caller waits on the works."""
     buf = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
     size = torch.tensor([len(payload)], dtype=torch.long)
-    dist.send(size, dst=dst_global_rank, group=group, tag=tag)
-    dist.send(buf, dst=dst_global_rank, group=group, tag=tag)
+    return [
+        (dist.isend(size, dst=dst_global_rank, group=group, tag=tag), size),
+        (dist.isend(buf, dst=dst_global_rank, group=group, tag=tag), buf),
+    ]
 
 
 def _recv_bytes(group, src_global_rank: int, tag: int = _REQ_FORWARD_TAG) -> bytes:
@@ -146,8 +150,14 @@ class PPReqForwardRelay:
         while True:
             tag, reqs = self._send_queue.get()
             payload = pickle.dumps((tag, reqs))
+            # Fan the async sends out to all stages in parallel instead of
+            # rendezvousing with each receiver in turn; same-tag operations
+            # to one peer still complete in issue order.
+            pending: List[Tuple[Any, torch.Tensor]] = []
             for dst in self._peer_globals:
-                _send_bytes(self._cpu_group, dst, payload)
+                pending.extend(_isend_bytes(self._cpu_group, dst, payload))
+            for work, _ in pending:
+                work.wait()
 
     def _recv_loop(self) -> None:
         while True:

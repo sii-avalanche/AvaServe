@@ -161,10 +161,19 @@ class PPOutputRelay:
                 # Host-block in the worker until the launch-time staging D2H
                 # drains; off the scheduler's critical path.
                 job.d2h_done.synchronize()
-                # Fan out directly to every earlier stage; the local stage
-                # consumes the same CPU copy below instead of a ring echo.
+                # Fan out directly to every earlier stage with async sends
+                # issued in parallel (not a per-receiver rendezvous in turn);
+                # the local stage consumes the same CPU copy below instead of
+                # a ring echo.
+                works = []
                 for dst in range(pp_group.world_size - 1):
-                    pp_group.send_tensor_dict(job.tensors, dst=dst)
+                    works.extend(
+                        pp_group.send_tensor_dict(
+                            job.tensors, dst=dst, async_send=True
+                        )
+                    )
+                for p2p_work in works:
+                    p2p_work.work.wait()
                 job.tensors.pop(MB_SLOT_KEY)
                 result = self._prep_result(
                     job.batch, job.metadata, PPProxyTensors(job.tensors)
