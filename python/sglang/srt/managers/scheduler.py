@@ -194,6 +194,7 @@ from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
+from sglang.srt.managers.pp_req_forward import PPReqForwardRelay
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -2169,6 +2170,17 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
 
     def init_request_receiver(self) -> None:
+        pp_req_relay = None
+        if (
+            self.ps.pp_size > 1
+            and get_disagg().disaggregation_mode == "null"
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            # Tagged fan-out request forwarding (see pp_req_forward.py);
+            # replaces the hop-by-hop gloo rendezvous between PP stages.
+            pp_req_relay = PPReqForwardRelay(pp_group=self.pp_group)
+        self.pp_req_relay = pp_req_relay
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -2184,6 +2196,7 @@ class Scheduler(
             attn_cp_cpu_group=self.attn_cp_cpu_group,
             world_group=self.world_group,
             server_args=self.server_args,
+            pp_req_relay=pp_req_relay,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),

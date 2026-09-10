@@ -70,114 +70,6 @@ def configure_humming_deepep_dispatch(layer: torch.nn.Module) -> bool:
     return use_fp8
 
 
-# Expert-dim chunk size for the staged MoE weight transform. Only one
-# chunk's repack output lives on the GPU at a time; per-sublayer results
-# accumulate in pinned host memory and move back after the originals are
-# freed. This caps the load-time GPU peak at ~one chunk instead of a full
-# sublayer copy (the default whole-layer transform allocates its entire
-# int32 repack output while all raw weights are still resident, which is
-# what OOMed TP=1/PP=8 and 17-layer TP=2 stages).
-_STAGED_TRANSFORM_CHUNK_EXPERTS = 16
-
-
-class _ExpertChunkProxy:
-    """Presents one expert slice of an MoE sublayer as a standalone layer.
-
-    Lets humming's own transform run unmodified on the chunk; the caller
-    only swaps in a chunk-sized ``num_experts`` meta (scale fusion reshapes
-    by it) and harvests the output parameters afterwards.
-    """
-
-    def __init__(self, tensors: dict[str, torch.Tensor]):
-        self._tensors = tensors
-
-    def state_dict(self):
-        return self._tensors
-
-
-def _transform_moe_sublayer_staged(
-    layer: torch.nn.Module,
-    sublayer_name: str,
-    meta_kwargs: dict,
-    chunk_experts: int = _STAGED_TRANSFORM_CHUNK_EXPERTS,
-) -> bool:
-    """Memory-frugal variant of HummingMethod.transform_humming_layer.
-
-    Runs the identical per-expert transform in expert-dim chunks (layout
-    repack, padding and scale fusion are all per-expert independent), moving
-    each chunk's outputs to pinned host memory. The original full-size
-    weights are deleted only after every chunk is processed, and the final
-    parameters are assembled back on the GPU afterwards -- so the transient
-    GPU overhead is one chunk instead of a whole second copy of the sublayer.
-    Returns False when the sublayer is not expert-stacked and the caller
-    must fall back to the whole-layer transform.
-    """
-    prefix = layer.humming_metas[sublayer_name].name_prefix
-    orig = {
-        name: param
-        for name, param in layer.named_parameters()
-        if name.startswith(prefix)
-    }
-    num_experts = meta_kwargs["num_experts"]
-    if not num_experts or not any(
-        t.ndim >= 1 and t.shape[0] == num_experts for t in orig.values()
-    ):
-        return False
-
-    device = next(iter(orig.values())).device
-    staged: dict[str, list[tuple[int, int, torch.Tensor]]] = {}
-    passthrough: dict[str, torch.Tensor] = {}
-    for start in range(0, num_experts, chunk_experts):
-        stop = min(start + chunk_experts, num_experts)
-        chunk_tensors = {
-            name: (
-                tensor[start:stop]
-                if tensor.ndim >= 1 and tensor.shape[0] == num_experts
-                else tensor
-            )
-            for name, tensor in orig.items()
-        }
-        proxy = _ExpertChunkProxy(chunk_tensors)
-        HummingMethod.prepare_layer_meta(
-            proxy, **{**meta_kwargs, "num_experts": stop - start}
-        )
-        HummingMethod.transform_humming_layer(proxy, sublayer_name=sublayer_name)
-        outputs = {
-            name: value.data
-            for name, value in vars(proxy).items()
-            if isinstance(value, torch.nn.Parameter)
-        }
-        if not all(
-            out.ndim >= 1 and out.shape[0] == stop - start for out in outputs.values()
-        ):
-            # Unexpected non-expert-leading output; cannot stitch safely.
-            return False
-        for name, out in outputs.items():
-            pinned = torch.empty(out.shape, dtype=out.dtype, pin_memory=True)
-            pinned.copy_(out, non_blocking=False)
-            staged.setdefault(name, []).append((start, stop, pinned))
-        del proxy, chunk_tensors, outputs
-
-    # Every chunk repacked: drop the originals first so their storage can be
-    # reused by the assembly allocations below. Parameters the transform did
-    # not produce (e.g. an optional zero_point the config disables) are put
-    # back verbatim, mirroring what the whole-layer transform would keep.
-    for name in orig:
-        delattr(layer, name)
-    for name, param in orig.items():
-        if name not in staged:
-            setattr(layer, name, param)
-    for name, chunks in staged.items():
-        first = chunks[0][2]
-        assembled = torch.empty(
-            (num_experts, *first.shape[1:]), dtype=first.dtype, device=device
-        )
-        for start, stop, pinned in chunks:
-            assembled[start:stop].copy_(pinned, non_blocking=False)
-        setattr(layer, name, torch.nn.Parameter(assembled, requires_grad=False))
-    return True
-
-
 def make_humming_deepep_input_schema(
     sublayer_name: str, shape_k: int
 ) -> HummingInputSchema:
@@ -307,24 +199,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             sublayer_name=sublayer_name,
         )
 
-        staged_ok = _transform_moe_sublayer_staged(
-            layer,
-            sublayer_name,
-            meta_kwargs=dict(
-                shape_n=shape_n,
-                shape_k=shape_k,
-                pad_n_to_multiple=256,
-                pad_k_to_multiple=128,
-                input_schema=sub_input_schema,
-                weight_schema=weight_schema_new,
-                has_bias=layer.with_bias,
-                num_experts=layer.num_local_experts,
-                torch_dtype=layer.params_dtype,
-                sublayer_name=sublayer_name,
-            ),
-        )
-        if not staged_ok:
-            HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
+        HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
 
     if not hasattr(layer, "locks"):
         device = layer.w13_weight.device

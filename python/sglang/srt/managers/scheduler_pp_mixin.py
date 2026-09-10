@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +15,10 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import (
+    TENSOR_DICT_SLICE_MIN_BYTES,
+    P2PWork,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -50,6 +53,7 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module
 
 logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -87,10 +91,11 @@ class SchedulerPPMixin:
         Stage P
         join the output of this slot's previous-round batch (relayed off the
           critical path by the PP output relay worker, see pp_output_relay.py)
-        recv ith req from previous stage
+        recv ith req (rank 0: tokenizer; others: tag-gated fan-out queue,
+          see pp_req_forward.py -- no hop-by-hop rendezvous)
         recv ith proxy from previous stage
         run ith batch
-        send ith req to next stage
+        rank 0: fan out ith req to all stages (worker thread)
         send ith proxy to next stage
 
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
@@ -101,6 +106,9 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_loop_iter += 1
+                if self.pp_req_relay is not None:
+                    self.pp_req_relay.set_loop_iteration(self._pp_loop_iter)
                 # Finalize the output of the batch that ran in this slot on
                 # the previous round, before it can be rescheduled below. The
                 # relay worker has done the transport + preprocessing off the
@@ -119,7 +127,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(cur_batch)
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -135,13 +143,11 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                if self.pp_group.is_first_rank and self.pp_req_relay is not None:
+                    # Fan out this iteration's requests to every stage with
+                    # the loop-iteration tag (worker thread does the gloo
+                    # sends; see pp_req_forward.py).
+                    self.pp_req_relay.submit(self._pp_loop_iter, recv_reqs)
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -253,7 +259,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(cur_batch)
 
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
@@ -389,7 +395,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors(cur_batch)
 
                 self._pp_commit_comm_work(self.send_proxy_work)
 
@@ -508,6 +514,10 @@ class SchedulerPPMixin:
         # Batches launched in each slot on the previous round, awaiting the
         # output-relay join at the top of the slot's next iteration.
         self._pp_ran_mbs: List[Optional[ScheduleBatch]] = [None] * self.pp_loop_size
+        # Loop iteration counter tagging forwarded requests (see
+        # pp_req_forward.py); every stage keeps its own and they stay aligned
+        # through the proxy data dependency.
+        self._pp_loop_iter = 0
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1031,13 +1041,16 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+
+    def _pp_recv_proxy_tensors(
+        self: Scheduler, cur_batch: Optional[ScheduleBatch] = None
+    ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             if self.launch_event is not None:
-                # See _do_recv: post the recv only after the just-launched
-                # forward completes, so the resident NCCL recv kernel cannot
-                # stall the cooperative flashinfer MLA decode kernels in the
+                # Post the tensor recv only after the just-launched forward
+                # completes, so the resident NCCL recv kernel cannot stall
+                # the cooperative flashinfer MLA decode kernels in the
                 # running decode graph.
                 torch.cuda.current_stream().wait_event(self.launch_event)
             pp_proxy_tensors = PPProxyTensors(

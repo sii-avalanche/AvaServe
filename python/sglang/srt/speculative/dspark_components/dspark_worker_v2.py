@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -89,6 +90,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+
 _is_npu = is_npu()
 
 
@@ -124,7 +126,15 @@ class DSparkSamplingCacheEntry:
             rows.append(row)
         if not any(r is not None for r in rows):
             return None, None
-        if all(r is not None for r in rows) and rows == list(range(len(rows))):
+        # The None-rows contract promises the stashed tensor is directly
+        # usable by the caller, so it must have exactly the query's row count:
+        # after trailing requests finish, the survivors sit at identity
+        # positions but the cache carries extra tail rows.
+        if (
+            len(self.rids) == len(rids)
+            and all(r is not None for r in rows)
+            and rows == list(range(len(rows)))
+        ):
             return self.corrected_logits, None
         return self.corrected_logits, rows
 
@@ -852,6 +862,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        staged_seq_lens = self._stage_seq_lens_d2h(accept.new_seq_lens)
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
@@ -910,6 +921,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
             sampling_info=sampling_info,
+            staged_seq_lens=staged_seq_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -967,6 +979,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if next_token_ids is not None:
             self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = prefix_lens + 1
+        staged_seq_lens = self._stage_seq_lens_d2h(new_seq_lens)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
@@ -990,6 +1003,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus=next_token_ids,
             new_seq_lens=new_seq_lens,
             sampling_info=batch.sampling_info,
+            staged_seq_lens=staged_seq_lens,
         )
 
         stride = int(self.verify_num_draft_tokens)
@@ -1010,6 +1024,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
         )
 
+    def _stage_seq_lens_d2h(self, new_seq_lens: torch.Tensor):
+        """Enqueue an async D2H of post-step seq lens right after the
+        producing kernels, so consuming it in `_propose_next` only waits for
+        those kernels instead of everything queued on the stream by then
+        (commit_hidden, mamba commits, draft prep)."""
+        cpu_mirror = _async_d2h(new_seq_lens)
+        done_event = torch.cuda.Event()
+        done_event.record()
+        return done_event, cpu_mirror
+
     def _propose_next(
         self,
         *,
@@ -1017,6 +1041,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         bonus: torch.Tensor,
         new_seq_lens: torch.Tensor,
         sampling_info,
+        staged_seq_lens,
     ) -> DFlashDraftInputV2:
         """Compute the proposal for the NEXT verify step on the draft host and
         pack it into the next draft input (relayed to the other PP ranks
@@ -1032,7 +1057,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The next verify's window gathers slots reserved by the scheduler's
         # per-step over-allocation; the draft rollout writes its KV there.
         batch.seq_lens = new_seq_lens
-        batch.seq_lens_cpu = new_seq_lens.to("cpu")
+        done_event, cpu_mirror = staged_seq_lens
+        done_event.synchronize()
+        batch.seq_lens_cpu = cpu_mirror
         next_window = alloc_verify_window(
             batch=batch,
             bs=len(new_seq_lens),

@@ -40,6 +40,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.pp_req_forward import PPReqForwardRelay
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
@@ -67,6 +68,10 @@ class SchedulerRequestReceiver:
     attn_cp_cpu_group: Any
     world_group: Any
     server_args: ServerArgs
+    # Tagged fan-out request forwarding (pp_req_forward.py); when set,
+    # non-first PP stages pull requests from it instead of the legacy
+    # hop-by-hop gloo rendezvous.
+    pp_req_relay: Optional[PPReqForwardRelay] = None
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
@@ -142,16 +147,24 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = (
-                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
-                )
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
+                if self.pp_req_relay is not None:
+                    # Fan-out path: drain the relay queue (tag-gated, see
+                    # pp_req_forward.py) instead of blocking on the
+                    # hop-by-hop gloo receive below.
+                    recv_reqs = self.pp_req_relay.poll()
+                else:
+                    dp_offset = (
+                        self.ps.attn_dp_rank
+                        * self.ps.attn_cp_size
+                        * self.ps.attn_tp_size
+                    )
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
         return recv_reqs
