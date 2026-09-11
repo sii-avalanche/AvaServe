@@ -769,11 +769,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._hosts_draft:
                 self._observers.note_idle_decode_step()
                 if get_parallel().enable_dp_attention:
-                    if self._draft_is_moe:
-                        self._proposer.run_idle_participation(batch)
+                    # Mirror the active decode order (target verify first, then
+                    # draft rollout). The EP MoE collectives of busy and idle
+                    # ranks pair positionally on the shared DeepEP buffer, so
+                    # running the draft dummy first permutes the pairing and
+                    # deadlocks the busy ranks' next forward.
                     self._verify_executor.run_idle_participation(
                         batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                     )
+                    if self._draft_is_moe:
+                        self._proposer.run_idle_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
@@ -786,12 +791,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         sampling_info = batch.sampling_info
         pending = draft_input.pending_draft_tokens
         if pending is None:
-            # No proposal available: the first decode step after a (re)prefill
-            # or a mixed batch. Run a plain target decode instead of a verify;
-            # the draft host proposes for the next step at the end.
-            return self._forward_plain_decode(
-                batch, on_publish, draft_input, pp_proxy_tensors
-            )
+            if get_parallel().enable_dp_attention:
+                # Under DP attention, idle peers mirror every decode step with
+                # verify-shaped dummies; a width-1 plain decode would break the
+                # per-rank token accounting (idle mirrors scale global counts by
+                # the verify width) and deadlock the EP collectives. Route the
+                # step through the verify path with an all-mask proposal
+                # instead: masks are never accepted, so the step emits exactly
+                # the bonus token, and the accept path falls back to
+                # target-only sampling for the missing draft logits.
+                pending = torch.full(
+                    (bs, self.gamma),
+                    self._mask_token_id,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            else:
+                # No proposal available: the first decode step after a
+                # (re)prefill or a mixed batch. Run a plain target decode
+                # instead of a verify; the draft host proposes for the next
+                # step at the end.
+                return self._forward_plain_decode(
+                    batch, on_publish, draft_input, pp_proxy_tensors
+                )
         draft_tokens = pending
 
         verify_window = alloc_verify_window(
