@@ -303,7 +303,14 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
-        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        # Effectively disable the application-level timeout on gloo
+        # control-plane channels (PP request-forward / output relay): a
+        # silent-but-alive peer is normal for an idle engine, and the previous
+        # 120-minute default killed PP deployments after 2h of idleness
+        # ("Timed out waiting 7200000ms for recv operation to complete").
+        # Genuine peer death still surfaces immediately via TCP connection
+        # reset; forward-pass hangs remain covered by --watchdog-timeout.
+        gloo_timeout: timedelta = timedelta(days=3650),
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
