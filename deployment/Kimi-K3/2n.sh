@@ -1,3 +1,7 @@
+# Concurrency tuning guide:
+#   --max-running-requests      max concurrency, adjust as needed
+#   --max-mamba-cache-size      set to 4x --max-running-requests
+#   --cuda-graph-max-bs-decode  set to --max-running-requests / --pp-size + 2
 NCCL_IB_HCA="=${HOST_RDMA_DEVICE}" \
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
 SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 \
@@ -14,6 +18,8 @@ sglang serve \
     --dcp-size 8 \
     --moe-runner-backend humming \
     --decode-attention-backend flashinfer \
+    --pp-prefill-delay-min-tokens 32768 \
+    --pp-prefill-delay-max-passes 32 \
     --dist-init-addr ${SGLANG_DIST_ADDR} \
     --nnodes 2 \
     --node-rank ${SGLANG_DIST_RANK} \
@@ -31,4 +37,6 @@ sglang serve \
     --enable-cache-report \
     --enable-hierarchical-cache \
     --hicache-ratio 4 \
+    --hicache-io-backend direct \
+    --hicache-mem-layout page_first_direct \
     --hicache-write-policy write_back
