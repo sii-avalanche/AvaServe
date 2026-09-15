@@ -27,3 +27,7 @@
    cd python
    pip install . --no-deps --no-build-isolation
    ```
+
+**Changes**
+
+See [our changes](log.md) for details
