@@ -1,5 +1,7 @@
 # AvaServe
 
+English | [简体中文](README_CN.md)
+
 **High performance LLM serving deployment**
 
 - Optimized for [Kimi K3](deployment/Kimi-K3), [DeepSeek V4 Pro](deployment/Kimi-K3), … models

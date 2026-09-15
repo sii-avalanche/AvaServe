@@ -1,5 +1,7 @@
 # AvaServe
 
+[English](README.md) | 简体中文
+
 **高性能 LLM 服务部署**
 
 - 优化 [Kimi K3](deployment/Kimi-K3)、[DeepSeek V4 Pro](deployment/Kimi-K3) 等模型
