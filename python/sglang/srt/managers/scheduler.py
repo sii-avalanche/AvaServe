@@ -211,6 +211,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1216,6 +1217,16 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval
         self._prefill_decode_interval_remaining = 0
+        self.num_continuous_decode_steps = get_schedule().num_continuous_decode_steps
+        self._continuous_decode_count = 0
+        self.pp_prefill_delay_min_tokens = (
+            get_schedule().pp_prefill_delay_min_tokens
+        )
+        self.pp_prefill_delay_max_passes = (
+            get_schedule().pp_prefill_delay_max_passes
+        )
+        self._queue_gate_held_passes = 0
+        self._queue_gate_open = False
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1265,6 +1276,107 @@ class Scheduler(
 
         self._prefill_decode_interval_remaining -= 1
         return True
+
+    def _should_continue_decode(self, running_batch: ScheduleBatch) -> bool:
+        """Honor --num-continuous-decode-steps: suppress new prefill admission
+        until N consecutive decode batches have run.
+
+        Two guards vs the naive port (and vs --prefill-decode-interval):
+        never suppress when the running batch is empty (no decode work to
+        protect -- suppressing would idle the engine), and never interrupt an
+        in-flight chunked prefill (keeps first-turn TTFT intact).
+        """
+        return (
+            self.num_continuous_decode_steps > 1
+            and self._continuous_decode_count < self.num_continuous_decode_steps
+            and not running_batch.is_empty()
+            and self.chunked_req is None
+        )
+
+    def _track_continuous_decode(self, batch: Optional[ScheduleBatch]) -> None:
+        if batch is None or batch.forward_mode.is_extend():
+            self._continuous_decode_count = 0
+        else:
+            self._continuous_decode_count += 1
+
+    def _waiting_queue_uncached_tokens(self, early_exit_at: int = 0) -> int:
+        """Estimated uncached prefill work in the waiting queue.
+        num_matched_prefix_tokens is populated at enqueue time and by
+        SchedulePolicy.calc_priority; it does not run while the gate is
+        holding, so new arrivals count as fully uncached and matched prefixes
+        only grow meanwhile -- the estimate errs towards opening early, never
+        late."""
+        total = 0
+        for r in self.waiting_queue:
+            total += max(len(r.origin_input_ids) - r.num_matched_prefix_tokens, 0)
+            if early_exit_at and total >= early_exit_at:
+                break
+        return total
+
+    def _log_queue_gate_release(
+        self, reason: str, running_batch: "ScheduleBatch", uncached_tokens: int
+    ) -> None:
+        if self.ps.pp_rank == 0 and self.ps.attn_tp_rank == 0:
+            logger.info(
+                f"QueueGate release: reason={reason} "
+                f"held_passes={self._queue_gate_held_passes} "
+                f"waiting_reqs={len(self.waiting_queue)} "
+                f"running_reqs={len(running_batch.reqs)} "
+                f"waiting_uncached_tokens={uncached_tokens}"
+            )
+
+    def _should_hold_prefill_for_queue(self, running_batch: ScheduleBatch) -> bool:
+        """Honor --pp-prefill-delay-min-tokens: hold new prefill admission
+        while the estimated uncached prefill work in the waiting queue is
+        below the threshold, so trickling arrivals accumulate into one larger
+        prefill burst instead of many tiny passes.
+
+        Hysteresis: once the threshold is reached the gate stays open until
+        the waiting queue drains, so a burst is not fragmented by the queue
+        dipping back below the threshold mid-burst. Same guards as
+        _should_continue_decode: never hold when there is no decode work
+        (holding would idle the engine), and never interrupt an in-flight
+        chunked prefill. The hold is bounded in forward passes
+        (--pp-prefill-delay-max-passes) rather than wall-clock time so
+        that all PP/TP ranks release on the same pass and stay in lockstep.
+        """
+        if (
+            self.pp_prefill_delay_min_tokens <= 0
+            or running_batch.is_empty()
+            or self.chunked_req is not None
+        ):
+            return False
+        if len(self.waiting_queue) == 0:
+            self._queue_gate_open = False
+            return False
+        if self._queue_gate_open:
+            # Burst in progress: keep draining the queue.
+            return False
+        self._queue_gate_held_passes += 1
+        uncached_tokens = self._waiting_queue_uncached_tokens(
+            early_exit_at=self.pp_prefill_delay_min_tokens
+        )
+        if self._queue_gate_held_passes > self.pp_prefill_delay_max_passes:
+            reason = "timeout"
+        elif uncached_tokens >= self.pp_prefill_delay_min_tokens:
+            reason = "threshold"
+        else:
+            return True
+        # Recompute the full sum for the log line (the check above may have
+        # exited early at the threshold).
+        self._log_queue_gate_release(
+            reason, running_batch, self._waiting_queue_uncached_tokens()
+        )
+        self._queue_gate_open = True
+        return False
+
+    def _track_queue_gate_hold(self, batch: Optional[ScheduleBatch]) -> None:
+        if (
+            batch is None
+            or batch.forward_mode.is_extend()
+            or len(self.waiting_queue) == 0
+        ):
+            self._queue_gate_held_passes = 0
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
@@ -3041,6 +3153,14 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            if self.pp_prefill_delay_min_tokens > 0:
+                # The queue gate's uncached-work estimate needs a real prefix
+                # match: requests otherwise stay unmatched
+                # (num_matched_prefix_tokens == 0) until admission and would
+                # count their full input as uncached, releasing the gate
+                # instantly. Matches only grow while waiting, so this stays
+                # conservative (errs towards opening early).
+                match_prefix_for_req(self.tree_cache, req, include_req=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3447,6 +3567,10 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
+        elif self._should_continue_decode(running_batch):
+            new_batch = None
+        elif self._should_hold_prefill_for_queue(running_batch):
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -3490,6 +3614,8 @@ class Scheduler(
             )
         ret = converted
         self._arm_prefill_decode_interval(ret)
+        self._track_continuous_decode(ret)
+        self._track_queue_gate_hold(ret)
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(

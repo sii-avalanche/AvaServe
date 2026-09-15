@@ -895,6 +895,16 @@ class ServerArgs:
         "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",
         NS("schedule"),
     ] = 1
+    pp_prefill_delay_min_tokens: A[
+        int,
+        "Hold new prefill admission until the waiting queue accumulates at least this many estimated uncached prefill tokens (input length minus matched prefix), so trickling arrivals accumulate into larger prefill bursts. Once opened, the gate stays open until the queue drains. Set to 0 to disable.",
+        NS("schedule"),
+    ] = 0
+    pp_prefill_delay_max_passes: A[
+        int,
+        "Maximum forward passes to hold prefill while the waiting queue is below --pp-prefill-delay-min-tokens, after which the prefill is admitted regardless. Bounded in passes (not wall-clock) so all pipeline-parallel ranks release on the same pass.",
+        NS("schedule"),
+    ] = 64
     scheduler_recv_interval: A[
         int,
         "The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
