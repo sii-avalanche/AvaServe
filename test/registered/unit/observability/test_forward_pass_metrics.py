@@ -197,6 +197,28 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
 
+    def test_emit_decode_batch_without_seq_lens_cpu(self):
+        reqs = [_FakeReq(10), _FakeReq(14)]
+        batch = self._make_batch(reqs=reqs, seq_lens_cpu=None)
+
+        self.reporter._emit_forward_pass_metrics(batch)
+
+        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
+        metrics = self.scheduler._fpm_publisher.metrics[0]
+        self.assertEqual(metrics.scheduled_requests.num_decode_requests, 2)
+        self.assertEqual(metrics.scheduled_requests.sum_decode_kv_tokens, 24)
+
+    def test_emit_decode_batch_prefers_seq_lens_cpu(self):
+        reqs = [_FakeReq(10), _FakeReq(14)]
+        batch = self._make_batch(reqs=reqs, seq_lens_cpu=[8, 13])
+
+        self.reporter._emit_forward_pass_metrics(batch)
+
+        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
+        metrics = self.scheduler._fpm_publisher.metrics[0]
+        self.assertEqual(metrics.scheduled_requests.num_decode_requests, 2)
+        self.assertEqual(metrics.scheduled_requests.sum_decode_kv_tokens, 21)
+
     def test_emit_uses_device_timer_gpu_time(self):
         self.scheduler._fpm_uses_device_timer = True
         self.scheduler._fpm_gpu_time_acc = 0.042
