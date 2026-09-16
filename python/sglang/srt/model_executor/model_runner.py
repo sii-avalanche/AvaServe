@@ -1013,6 +1013,21 @@ class ModelRunner:
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).
         resolved = resolve_attention_backend_strs(model_runner=self)
+        if (
+            get_parallel().pp_size > 1
+            and self.spec_algorithm.is_speculative()
+            and "flashinfer" in (resolved.prefill, resolved.decode)
+        ):
+            raise ValueError(
+                "PP + speculative decoding + flashinfer attention backend is "
+                "not supported: replay-time flashinfer plan state can race an "
+                "in-flight graph from another microbatch (pinned-staging WAR "
+                "hazard), and the draft/verify graph paths are not yet "
+                "validated against it. Use a non-flashinfer backend "
+                "(e.g. --decode-attention-backend flashmla or trtllm_mla, and "
+                "--speculative-draft-attention-backend accordingly), or run "
+                "without pipeline parallelism / speculative decoding."
+            )
         self.prefill_attention_backend_str = resolved.prefill
         self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)

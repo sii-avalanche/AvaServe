@@ -18,6 +18,7 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -29,6 +30,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
+)
+from sglang.srt.layers.attention.plan_staging_pool import (
+    plan_staging_buffer,
+    pooled_pin_workspace,
 )
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
@@ -473,30 +478,35 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             ):
                 ndt = spec_info.num_tokens_per_req
                 bs = forward_batch.batch_size
-                self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
+                # Fresh pageable arrays (see the target-verify replay branch
+                # below for why persistent pinned sources are unsafe); the
+                # stock plan fed CPU tensors skips its blocking D2H drain, so
+                # its pinned staging is pooled as well.
+                kv_len_arr_cpu = forward_batch.seq_lens_cpu[:bs].to(torch.int32)
+                kv_indptr_cpu = torch.zeros(bs + 1, dtype=torch.int32)
+                torch.cumsum(kv_len_arr_cpu, dim=0, out=kv_indptr_cpu[1:])
+                qo_indptr_cpu = torch.arange(
                     0, (bs + 1) * ndt, ndt, dtype=torch.int32
                 )
-                self.fast_plan_kv_len_arr_cpu[:bs] = forward_batch.seq_lens_cpu[:bs]
-                self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
-                    self.fast_plan_kv_len_arr_cpu[:bs], dim=0
-                )
-                qo_indptr_cpu = self.fast_plan_qo_indptr_cpu[: bs + 1]
-                kv_indptr_cpu = self.fast_plan_kv_indptr_cpu[: bs + 1]
-                kv_len_arr_cpu = self.fast_plan_kv_len_arr_cpu[:bs]
 
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=use_ragged,
-                attn_dcp_metadata=forward_batch.attn_dcp_metadata,
-                qo_indptr_cpu=qo_indptr_cpu,
-                kv_indptr_cpu=kv_indptr_cpu,
-                kv_len_arr_cpu=kv_len_arr_cpu,
-                kv_view=kv_view,
-            )
+            with (
+                pooled_pin_workspace(self.prefill_wrapper_paged)
+                if qo_indptr_cpu is not None
+                else nullcontext()
+            ):
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens,
+                    prefill_wrapper_paged=self.prefill_wrapper_paged,
+                    use_ragged=use_ragged,
+                    attn_dcp_metadata=forward_batch.attn_dcp_metadata,
+                    qo_indptr_cpu=qo_indptr_cpu,
+                    kv_indptr_cpu=kv_indptr_cpu,
+                    kv_len_arr_cpu=kv_len_arr_cpu,
+                    kv_view=kv_view,
+                )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
             )
@@ -590,13 +600,32 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_cpu is not None and spec_info is not None
             ), "target-verify cuda-graph replay requires host-resident seq_lens_cpu"
             ndt = spec_info.draft_token_num
-            self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
-                0, (bs + 1) * ndt, ndt, dtype=torch.int32
-            )
-            self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
-            self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
-                self.fast_plan_kv_len_arr_cpu[:bs], dim=0
-            )
+            if in_capture:
+                # Capture-time H2D sources must be pinned; capture is
+                # single-threaded and fenced, so the persistent pinned
+                # buffers are safe here.
+                self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
+                    0, (bs + 1) * ndt, ndt, dtype=torch.int32
+                )
+                self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
+                self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    self.fast_plan_kv_len_arr_cpu[:bs], dim=0
+                )
+                qo_indptr_cpu = self.fast_plan_qo_indptr_cpu[: bs + 1]
+                kv_indptr_cpu = self.fast_plan_kv_indptr_cpu[: bs + 1]
+                kv_len_arr_cpu = self.fast_plan_kv_len_arr_cpu[:bs]
+            else:
+                # Fresh pageable arrays: the CUDA driver stages pageable H2D
+                # sources at call time, so unlike the persistent pinned
+                # buffers these cannot be overwritten by the next
+                # microbatch's prep while a previous async copy from them is
+                # still queued behind an in-flight graph replay.
+                kv_len_arr_cpu = (seq_lens_cpu[:bs] + ndt).to(torch.int32)
+                kv_indptr_cpu = torch.zeros(bs + 1, dtype=torch.int32)
+                torch.cumsum(kv_len_arr_cpu, dim=0, out=kv_indptr_cpu[1:])
+                qo_indptr_cpu = torch.arange(
+                    0, (bs + 1) * ndt, ndt, dtype=torch.int32
+                )
             fast_verify_plan_kwargs = self._build_fast_verify_plan_kwargs(
                 bs=bs,
                 spec_info=spec_info,
@@ -618,19 +647,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fast_verify_plan_kwargs=fast_verify_plan_kwargs,
                 qo_indptr_cpu=(
-                    self.fast_plan_qo_indptr_cpu[: bs + 1]
-                    if use_generic_fast_plan
-                    else None
+                    qo_indptr_cpu if use_generic_fast_plan else None
                 ),
                 kv_indptr_cpu=(
-                    self.fast_plan_kv_indptr_cpu[: bs + 1]
-                    if use_generic_fast_plan
-                    else None
+                    kv_indptr_cpu if use_generic_fast_plan else None
                 ),
                 kv_len_arr_cpu=(
-                    self.fast_plan_kv_len_arr_cpu[:bs]
-                    if use_generic_fast_plan
-                    else None
+                    kv_len_arr_cpu if use_generic_fast_plan else None
                 ),
                 kv_view=kv_view,
             )
@@ -1362,18 +1385,24 @@ def fast_mla_decode_plan(
     self._sm_scale = sm_scale
 
     try:
-        # Standard version with just the required arguments (no use_profiler)
-        self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            kv_len_arr_cpu,
-            num_heads,
-            head_dim_ckv,
-            causal,
-        )
+        # Standard version with just the required arguments (no use_profiler).
+        # The pinned staging buffer comes from the rotation pool: the native
+        # plan writes it with plain host stores and then enqueues an async
+        # H2D from it, so a shared buffer could be overwritten by the next
+        # microbatch's plan while that copy is still queued behind an
+        # in-flight graph replay.
+        with plan_staging_buffer(self._pin_memory_int_workspace_buffer) as staging:
+            self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                staging,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                kv_len_arr_cpu,
+                num_heads,
+                head_dim_ckv,
+                causal,
+            )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA plan: {e}")
 
@@ -1410,16 +1439,18 @@ def fast_mla_prefill_plan(
     self._kv_len_arr_buf.copy_(kv_len_arr_cpu, non_blocking=True)
 
     try:
-        self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            kv_len_arr_cpu,
-            num_heads,
-            head_dim_ckv,
-            causal,
-        )
+        # See fast_mla_decode_plan for why the pinned staging buffer is pooled.
+        with plan_staging_buffer(self._pin_memory_int_workspace_buffer) as staging:
+            self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                staging,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                kv_len_arr_cpu,
+                num_heads,
+                head_dim_ckv,
+                causal,
+            )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA prefill plan: {e}")

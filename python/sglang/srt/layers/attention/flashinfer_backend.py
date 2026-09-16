@@ -31,6 +31,10 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.plan_staging_pool import (
+    plan_staging_buffer,
+    pooled_pin_workspace,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -287,7 +291,25 @@ def fast_prefill_plan(
         0,  # num_colocated_ctas
         0,  # uniform_q_len
     ]
-    self._plan_info = self._cached_module.plan(*args)
+    # The pinned staging buffer comes from the rotation pool: the native plan
+    # writes it with plain host stores and then enqueues an async H2D from
+    # it, so a shared buffer could be overwritten by the next microbatch's
+    # plan while that copy is still queued behind an in-flight graph replay.
+    with plan_staging_buffer(self._pin_memory_int_workspace_buffer) as staging:
+        args[2] = staging
+        self._plan_info = self._cached_module.plan(*args)
+
+
+def _pooled_fast_decode_plan(wrapper, *args, **kwargs):
+    """flashinfer's vendor ``fast_decode_plan`` with pooled pinned staging.
+
+    Same hazard as ``fast_prefill_plan`` above: the vendor function passes
+    the wrapper's shared ``_pin_memory_int_workspace_buffer`` to the native
+    plan, so swap in a rotation slot for the duration of the call (the
+    pointer is consumed inside it).
+    """
+    with pooled_pin_workspace(wrapper):
+        return fast_decode_plan(wrapper, *args, **kwargs)
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -807,9 +829,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if in_capture and forward_mode.is_decode_or_idle():
             # fast_decode_plan needs _cached_module from the initial begin_forward
-            # above, so install it only after that first plan has run.
+            # above, so install it only after that first plan has run. The
+            # pooled variant routes the native plan's pinned staging buffer
+            # through the rotation pool (see _pooled_fast_decode_plan).
             for w in self.decode_cuda_graph_metadata[bs]:
-                w.begin_forward = partial(fast_decode_plan, w)
+                w.begin_forward = partial(_pooled_fast_decode_plan, w)
 
         if (
             in_capture
@@ -1780,7 +1804,7 @@ class FlashInferIndicesUpdaterDecode:
         # by checking if it's a partial function with fast_decode_plan as the func
         wrapper_uses_fast_decode_plan = (
             hasattr(wrapper.begin_forward, "func")
-            and wrapper.begin_forward.func == fast_decode_plan
+            and wrapper.begin_forward.func == _pooled_fast_decode_plan
         )
 
         if wrapper_uses_fast_decode_plan:
