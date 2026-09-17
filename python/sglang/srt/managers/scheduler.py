@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import dataclasses
+import enum
 import faulthandler
 import logging
 import os
@@ -374,6 +375,14 @@ STEP_MAX_US = 2_000_000
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
+
+
+class _PrefillPhase(enum.Enum):
+    """Phased prefill/decode scheduling state (--pp-prefill-delay-min-tokens)."""
+
+    DECIDE = "decide"
+    DECODE = "decode"
+    PREFILL = "prefill"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1225,8 +1234,8 @@ class Scheduler(
         self.pp_prefill_delay_max_passes = (
             get_schedule().pp_prefill_delay_max_passes
         )
-        self._queue_gate_held_passes = 0
-        self._queue_gate_open = False
+        self._prefill_phase = _PrefillPhase.DECIDE
+        self._phase_budget_passes = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1313,70 +1322,94 @@ class Scheduler(
                 break
         return total
 
-    def _log_queue_gate_release(
+    def _pending_prefill_tokens(self) -> int:
+        """Estimated uncached prefill work pending: the waiting queue plus the
+        remaining chunks of an in-flight chunked prefill (which is no longer in
+        the waiting queue but still owes extend passes)."""
+        total = self._waiting_queue_uncached_tokens()
+        if self.chunked_req is not None:
+            total += max(
+                len(self.chunked_req.origin_input_ids)
+                - len(self.chunked_req.prefix_indices),
+                0,
+            )
+        return total
+
+    def _enter_prefill_phase(
         self, reason: str, running_batch: "ScheduleBatch", uncached_tokens: int
     ) -> None:
+        chunk = self.chunked_prefill_size
+        budget = max(1, (uncached_tokens + chunk - 1) // chunk) if chunk > 0 else 1
+        self._prefill_phase = _PrefillPhase.PREFILL
+        self._phase_budget_passes = budget
         if self.ps.pp_rank == 0 and self.ps.attn_tp_rank == 0:
             logger.info(
-                f"QueueGate release: reason={reason} "
-                f"held_passes={self._queue_gate_held_passes} "
+                f"PrefillPhase start: reason={reason} "
+                f"budget_passes={budget} "
                 f"waiting_reqs={len(self.waiting_queue)} "
                 f"running_reqs={len(running_batch.reqs)} "
-                f"waiting_uncached_tokens={uncached_tokens}"
+                f"uncached_tokens={uncached_tokens}"
             )
 
     def _should_hold_prefill_for_queue(self, running_batch: ScheduleBatch) -> bool:
-        """Honor --pp-prefill-delay-min-tokens: hold new prefill admission
-        while the estimated uncached prefill work in the waiting queue is
-        below the threshold, so trickling arrivals accumulate into one larger
-        prefill burst instead of many tiny passes.
+        """Phased prefill/decode scheduling (--pp-prefill-delay-min-tokens).
 
-        Hysteresis: once the threshold is reached the gate stays open until
-        the waiting queue drains, so a burst is not fragmented by the queue
-        dipping back below the threshold mid-burst. Same guards as
-        _should_continue_decode: never hold when there is no decode work
-        (holding would idle the engine), and never interrupt an in-flight
-        chunked prefill. The hold is bounded in forward passes
-        (--pp-prefill-delay-max-passes) rather than wall-clock time so
-        that all PP/TP ranks release on the same pass and stay in lockstep.
+        DECIDE: pending uncached tokens >= threshold -> PREFILL phase;
+        otherwise -> DECODE phase of --pp-prefill-delay-max-passes passes.
+        A finished DECODE phase is always followed by a PREFILL phase covering
+        whatever accumulated meanwhile, so sparse arrivals face a bounded delay
+        without any wall-clock timeout. A PREFILL phase lasts
+        ceil(pending / chunked_prefill_size) extend passes: requests arriving
+        mid-phase may fill slack in those passes but cannot extend the phase,
+        so trickling arrivals cannot chain tiny prefills, and bursts arriving
+        during a DECODE phase cannot interrupt it.
+
+        All transitions are driven by forward-pass counts and local queue
+        state, which are identical across PP/TP ranks, so ranks switch phases
+        on the same pass and stay in lockstep.
         """
-        if (
-            self.pp_prefill_delay_min_tokens <= 0
-            or running_batch.is_empty()
-            or self.chunked_req is not None
+        if self.pp_prefill_delay_min_tokens <= 0:
+            return False
+        if running_batch.is_empty() or (
+            len(self.waiting_queue) == 0 and self.chunked_req is None
         ):
+            # No decode work to protect, or no prefill work pending: disengage
+            # and re-enter at DECIDE once both exist again.
+            self._prefill_phase = _PrefillPhase.DECIDE
             return False
-        if len(self.waiting_queue) == 0:
-            self._queue_gate_open = False
-            return False
-        if self._queue_gate_open:
-            # Burst in progress: keep draining the queue.
-            return False
-        self._queue_gate_held_passes += 1
-        uncached_tokens = self._waiting_queue_uncached_tokens(
-            early_exit_at=self.pp_prefill_delay_min_tokens
-        )
-        if self._queue_gate_held_passes > self.pp_prefill_delay_max_passes:
-            reason = "timeout"
-        elif uncached_tokens >= self.pp_prefill_delay_min_tokens:
-            reason = "threshold"
-        else:
-            return True
-        # Recompute the full sum for the log line (the check above may have
-        # exited early at the threshold).
-        self._log_queue_gate_release(
-            reason, running_batch, self._waiting_queue_uncached_tokens()
-        )
-        self._queue_gate_open = True
-        return False
 
-    def _track_queue_gate_hold(self, batch: Optional[ScheduleBatch]) -> None:
-        if (
-            batch is None
-            or batch.forward_mode.is_extend()
-            or len(self.waiting_queue) == 0
+        if self._prefill_phase == _PrefillPhase.DECIDE:
+            uncached_tokens = self._pending_prefill_tokens()
+            if uncached_tokens >= self.pp_prefill_delay_min_tokens:
+                self._enter_prefill_phase("threshold", running_batch, uncached_tokens)
+            else:
+                self._prefill_phase = _PrefillPhase.DECODE
+                self._phase_budget_passes = self.pp_prefill_delay_max_passes
+        elif (
+            self._prefill_phase == _PrefillPhase.DECODE
+            and self._phase_budget_passes <= 0
         ):
-            self._queue_gate_held_passes = 0
+            uncached_tokens = self._pending_prefill_tokens()
+            if uncached_tokens > 0:
+                self._enter_prefill_phase(
+                    "after-decode", running_batch, uncached_tokens
+                )
+            else:
+                # Nothing accumulated; keep decoding.
+                self._phase_budget_passes = self.pp_prefill_delay_max_passes
+
+        return self._prefill_phase == _PrefillPhase.DECODE
+
+    def _track_prefill_phase(self, batch: Optional[ScheduleBatch]) -> None:
+        if batch is None:
+            return
+        if batch.forward_mode.is_extend():
+            if self._prefill_phase == _PrefillPhase.PREFILL:
+                self._phase_budget_passes -= 1
+                if self._phase_budget_passes <= 0:
+                    self._prefill_phase = _PrefillPhase.DECIDE
+        elif self._prefill_phase == _PrefillPhase.DECODE:
+            self._phase_budget_passes -= 1
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
@@ -3615,7 +3648,7 @@ class Scheduler(
         ret = converted
         self._arm_prefill_decode_interval(ret)
         self._track_continuous_decode(ret)
-        self._track_queue_gate_hold(ret)
+        self._track_prefill_phase(ret)
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(

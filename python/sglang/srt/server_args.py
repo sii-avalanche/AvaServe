@@ -897,12 +897,12 @@ class ServerArgs:
     ] = 1
     pp_prefill_delay_min_tokens: A[
         int,
-        "Hold new prefill admission until the waiting queue accumulates at least this many estimated uncached prefill tokens (input length minus matched prefix), so trickling arrivals accumulate into larger prefill bursts. Once opened, the gate stays open until the queue drains. Set to 0 to disable.",
+        "Enable phased prefill/decode scheduling. At each phase boundary, if the pending uncached prefill work (waiting-queue input tokens minus matched prefix, plus any in-flight chunked-prefill remainder) reaches this many tokens, a prefill phase runs immediately; otherwise prefill is held for a decode phase of --pp-prefill-delay-max-passes passes, after which whatever accumulated is prefilled unconditionally. A prefill phase lasts ceil(pending / chunked_prefill_size) extend passes: requests arriving mid-phase may fill slack in those passes but cannot extend the phase. Set to 0 to disable. Cannot be combined with --num-continuous-decode-steps.",
         NS("schedule"),
     ] = 0
     pp_prefill_delay_max_passes: A[
         int,
-        "Maximum forward passes to hold prefill while the waiting queue is below --pp-prefill-delay-min-tokens, after which the prefill is admitted regardless. Bounded in passes (not wall-clock) so all pipeline-parallel ranks release on the same pass.",
+        "Number of consecutive decode passes per decode phase when --pp-prefill-delay-min-tokens is enabled; afterwards prefill is admitted unconditionally. Counted in forward passes (not wall-clock) so all pipeline-parallel ranks switch phases on the same pass.",
         NS("schedule"),
     ] = 64
     scheduler_recv_interval: A[

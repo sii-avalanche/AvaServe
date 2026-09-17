@@ -63,6 +63,15 @@ def check_server_args(server_args: Any):
         )
 
     assert not (
+        cfg.pp_prefill_delay_min_tokens > 0 and cfg.num_continuous_decode_steps > 1
+    ), (
+        "--pp-prefill-delay-min-tokens cannot be combined with "
+        "--num-continuous-decode-steps: phased prefill/decode scheduling already "
+        "bounds how long prefill can be delayed via --pp-prefill-delay-max-passes, "
+        "and stacking both mechanisms would double-suppress prefill admission"
+    )
+
+    assert not (
         cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention
     ), "multi-node data parallel is not supported unless dp attention!"
 
