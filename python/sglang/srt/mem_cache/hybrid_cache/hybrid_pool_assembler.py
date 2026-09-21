@@ -1324,8 +1324,20 @@ class _MambaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
-        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        # The L2 H->D load engine iterates stage-local layer ids
+        # (0..transfer_layer_num), so mappings must be keyed stage-locally.
+        # The raw maps are keyed by global model layer id: on a PP stage with
+        # start_layer > 0 every stage-local lookup misses and the load DMA
+        # silently no-ops, leaving restored slots with stale content.
+        start_layer = getattr(kvcache, "start_layer", 0)
+        full_layer_mapping = {
+            gid - start_layer: lid
+            for gid, lid in kvcache.full_attention_layer_id_mapping.items()
+        }
+        mamba_layer_mapping = {
+            gid - start_layer: lid
+            for gid, lid in params.req_to_token_pool.mamba_map.items()
+        }
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             kv_pool=kvcache.full_kv_pool,
