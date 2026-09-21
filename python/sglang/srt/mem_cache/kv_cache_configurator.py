@@ -1997,10 +1997,18 @@ class KVCacheConfigurator:
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
         gc.collect()
+        # PP>1: profile this rank's OWN free memory. The world MIN on the token
+        # capacity in _apply_token_constraints already guarantees a globally
+        # consistent, everywhere-fitting pool size; min-syncing free memory
+        # here first would charge every rank with the worst rank's budget AND
+        # the worst rank's per-token cell size -- overly conservative with
+        # uneven PP stages or a last-rank-only draft pool. PP=1 has no
+        # capacity sync, so the free-memory MIN is the only cross-rank
+        # agreement mechanism there and must be kept.
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1 and self.ps.pp_size <= 1,
             cpu_group=get_world_group().cpu_group,
         )
 
