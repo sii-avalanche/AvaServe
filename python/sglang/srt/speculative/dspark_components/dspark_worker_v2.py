@@ -1176,16 +1176,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             else (None, None)
         )
         if stashed_logits is None:
-            # No stashed logits (first step after a (re)prefill): make the
-            # draft "certain" of the mask token so the rejection rule rejects
-            # every draft (p_draft(candidate) ~ 1 ⇒ accept prob ~ p_target ≈ 0)
-            # and the bonus is sampled from the target distribution.
+            # No stashed logits (first step after a (re)prefill): fall back to
+            # exact target-only sampling. Putting the spike on the actual
+            # candidates makes q a delta on the candidate, so the rejection
+            # rule accepts it with prob p(candidate) and otherwise resamples
+            # from (p-q)+ -- the emitted distribution stays exactly the target
+            # distribution (the draft only loses its acceleration). Spiking
+            # the mask token instead would make q(candidate) ~ 0 and accept
+            # every draft unconditionally, corrupting the output distribution.
             corrected_logits = torch.zeros(
                 (bs, self.gamma, self._target_vocab_size),
                 dtype=torch.float32,
                 device=self.device,
             )
-            corrected_logits[:, :, self._mask_token_id] = 1e9
+            corrected_logits.scatter_(
+                2, draft_tokens.clamp(min=0).unsqueeze(-1), 1e9
+            )
             return DraftBlockResult(
                 draft_tokens=draft_tokens,
                 corrected_logits=corrected_logits,
@@ -1209,7 +1215,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 dtype=stashed_logits.dtype,
                 device=self.device,
             )
-            corrected_logits[:, :, self._mask_token_id] = 1e9
+            # Miss rows fall back to exact target-only sampling (q = delta on
+            # the candidate), same as the no-stash path above.
+            corrected_logits.scatter_(
+                2, draft_tokens.clamp(min=0).unsqueeze(-1), 1e9
+            )
             if hit.any():
                 corrected_logits[hit] = stashed_logits[src_rows[hit]]
         return DraftBlockResult(
