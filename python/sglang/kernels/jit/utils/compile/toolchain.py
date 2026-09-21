@@ -160,7 +160,15 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         return flags
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    # The toolkit lib64 only covers libcudart; the driver library (libcuda.so)
+    # is injected into /usr/local/nvidia/lib64 in GPU pods and is otherwise not
+    # on ld's link-time search path (LD_LIBRARY_PATH is runtime-only), so
+    # modules linking `-lcuda` fail without the extra -L.
+    return flags + [
+        f"-L{cuda_home()}/lib64",
+        "-lcudart",
+        "-L/usr/local/nvidia/lib64",
+    ]
 
 
 def compilers() -> Tuple[str, str]:
