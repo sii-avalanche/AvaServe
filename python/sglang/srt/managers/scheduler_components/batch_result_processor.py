@@ -1040,6 +1040,17 @@ class SchedulerBatchResultProcessor:
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
+            if (
+                not batch.spec_algorithm.is_none()
+                and next_token_logprobs
+                and not isinstance(next_token_logprobs[0], list)
+            ):
+                # The spec plain-decode fallback (the first step after a
+                # (re)prefill or a mixed batch) produces non-spec scalar
+                # logprobs; wrap them into the per-req list layout that spec
+                # verify batches use, or _apply_decode_logprobs crashes on
+                # len(float).
+                next_token_logprobs = [[x] for x in next_token_logprobs]
             if logits_output.next_token_top_logprobs_val:
                 logits_output.next_token_top_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_top_logprobs_val
