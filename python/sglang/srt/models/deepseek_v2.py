@@ -2670,7 +2670,16 @@ class DeepseekV2Model(nn.Module):
         else:
             self.cp_size = None
 
-        if self.pp_group.is_first_rank:
+        # A DSpark draft hosted on the last PP stage shares the target's
+        # embedding, so that stage keeps a real (loaded) copy instead of a
+        # PPMissingLayer; the standard weight loader fills it like any other
+        # rank-local module. (Same pattern as Kimi-K3.)
+        keep_embed_for_dspark = (
+            self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+            and get_spec().speculative_algorithm == "DSPARK"
+        )
+        if self.pp_group.is_first_rank or keep_embed_for_dspark:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -2782,6 +2791,12 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        # DSpark aux hidden capture: per-stage hook ids into the layer loop
+        # below, precomputed by set_dspark_layers_to_capture on the
+        # ForCausalLM (None when DSpark aux capture is off). A stage owning
+        # no aux layers holds an empty list and only relays upstream captures
+        # downstream through PPProxyTensors.
+        self.dspark_hook_ids: Optional[List[int]] = None
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
@@ -2881,9 +2896,30 @@ class DeepseekV2Model(nn.Module):
                 positions=positions,
             )
 
+        # DSpark aux hidden relay: each PP rank captures the aux layers it
+        # owns (hook ids precomputed in set_dspark_layers_to_capture) and
+        # forwards the accumulated [num_tokens, L, hidden] stack downstream
+        # under the "dspark_aux" key; the last rank rebuilds the full aux
+        # list in global layer order.
+        capture_dspark = self.dspark_hook_ids is not None
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        upstream_dspark_aux = None
+        # The first rank has no upstream; under CUDA graph replay its proxy
+        # argument is a static buffer that may hold a stale "dspark_aux", so
+        # gate on is_first_rank exactly like the hidden_states path above.
+        if (
+            capture_dspark
+            and not self.pp_group.is_first_rank
+            and pp_proxy_tensors is not None
+        ):
+            upstream_dspark_aux = pp_proxy_tensors.tensors.get("dspark_aux")
+        local_capture = bool(self.dspark_hook_ids)
+
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        # DSpark aux capture needs the per-layer eager loop (the TBO tail
+        # cannot expose per-layer hidden states), so skip TBO when capturing.
+        if forward_batch.can_run_tbo and not local_capture:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -2912,7 +2948,13 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=index_topk_share.topk_indices,
                     captured_last_layer_outputs=(
-                        aux_hidden_states if i in self.layers_to_capture else None
+                        aux_hidden_states
+                        if i in self.layers_to_capture
+                        else (
+                            dspark_aux_hidden_states
+                            if local_capture and i in self.dspark_hook_ids
+                            else None
+                        )
                     ),
                     next_full_attention_layer_id=self.next_full_attention_layer_id.get(
                         i
@@ -2939,6 +2981,17 @@ class DeepseekV2Model(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual,
             }
+            if capture_dspark:
+                # Relay aux downstream: upstream captures first, then this
+                # rank's own, matching the global layer order. Stacked as
+                # [num_tokens, L, hidden] since PPProxyTensors carries tensors.
+                parts = []
+                if upstream_dspark_aux is not None:
+                    parts.append(upstream_dspark_aux)
+                if dspark_aux_hidden_states:
+                    parts.append(torch.stack(dspark_aux_hidden_states, dim=1))
+                if parts:
+                    proxy_tensors["dspark_aux"] = torch.cat(parts, dim=1)
             if (
                 self.use_dsa
                 and dsa_forward_uses_topk
@@ -2976,6 +3029,16 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        if capture_dspark:
+            # Rebuild the full aux list in global layer order: upstream-
+            # relayed layers first, then this rank's own captures.
+            full_aux = list(dspark_aux_hidden_states)
+            if upstream_dspark_aux is not None:
+                full_aux = [
+                    upstream_dspark_aux[:, i, :]
+                    for i in range(upstream_dspark_aux.shape[1])
+                ] + full_aux
+            return hidden_states, full_aux
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states.finalize()
@@ -3181,16 +3244,16 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
-        else:
-            return hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
 
     @property
     def start_layer(self):
@@ -3250,6 +3313,32 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+
+        # Each stage captures the aux layers it owns and relays them to the
+        # last stage through PPProxyTensors (see DeepseekV2Model.forward).
+        # The capture hook fires inside the successor layer (hook id =
+        # lid + 1, see prepare_attn_and_capture_last_layer_outputs), so an
+        # aux layer on a stage's last layer has no successor here and is
+        # rejected (same restriction as Kimi-K3).
+        boundary = [lid for lid in layer_ids if lid + 1 == self.model.end_layer]
+        if boundary:
+            raise NotImplementedError(
+                f"DSPARK aux capture layers {boundary} coincide with this PP "
+                "stage's last layer; adjust SGLANG_PP_LAYER_PARTITION so "
+                "every capture layer has its successor on the same stage."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_hook_ids = [
+            lid + 1
+            for lid in layer_ids
+            if self.model.start_layer <= lid < self.model.end_layer
+        ]
 
     def prepare_context_parallel_metadata_for_dcp(
         self,

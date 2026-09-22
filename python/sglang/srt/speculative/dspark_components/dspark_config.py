@@ -13,7 +13,10 @@ from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    is_speculators_draft_config,
+    parse_dflash_draft_config,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -70,6 +73,23 @@ def draft_is_deepseek_v4() -> bool:
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
 
 
+def read_draft_hf_config() -> Any:
+    """Load the draft checkpoint's HF config without loading draft weights.
+
+    Reads the resolved speculative draft model path, which the speculative
+    hook defaults to the target checkpoint itself when the draft is bundled,
+    so this is correct for bundled and separate drafts alike."""
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    return get_config(
+        get_spec().speculative_draft_model_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        model_override_args=json.loads(get_model().json_model_override_args),
+        model_config_parser=get_model().model_config_parser,
+    )
+
+
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     gamma = int(num_draft_tokens) - 1
     if gamma < 1:
@@ -89,6 +109,9 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    # True when the checkpoint follows the speculators/vLLM aux convention
+    # (layer-input ids, plain residual stream); see is_speculators_draft_config.
+    vllm_aux_convention: bool = False
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -326,6 +349,28 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     else:
         target_layer_ids = base.target_layer_ids
 
+    vllm_aux_convention = False
+    if prefixed_target_layer_ids is None and is_speculators_draft_config(
+        draft_hf_config
+    ):
+        # Speculators checkpoints name their aux layers
+        # aux_hidden_state_layer_ids under the vLLM layer-input convention
+        # (id k = stream entering layer k); parse_dflash_draft_config maps them
+        # to target_layer_ids. Id 0 (the embedding output) has no sglang
+        # capture layer and is rejected.
+        if target_layer_ids is None:
+            raise ValueError(
+                "DSpark speculators-format draft requires a non-empty "
+                "aux_hidden_state_layer_ids list, got None."
+            )
+        if min(target_layer_ids) < 1:
+            raise ValueError(
+                "DSpark speculators aux_hidden_state_layer_ids must be >= 1 "
+                "(id 0, the embedding output, is not supported for aux capture), "
+                f"got {target_layer_ids}."
+            )
+        vllm_aux_convention = True
+
     return DSparkDraftConfig(
         num_hidden_layers=base.num_hidden_layers,
         num_target_layers=base.num_target_layers,
@@ -335,4 +380,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        vllm_aux_convention=vllm_aux_convention,
     )

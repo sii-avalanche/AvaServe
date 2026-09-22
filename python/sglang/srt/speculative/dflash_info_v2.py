@@ -274,15 +274,18 @@ class DFlashDraftInputV2(SpecInput):
                 self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
             self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
 
-        if self.future_indices is not None:
-            self.future_indices = self.future_indices[new_indices]
-            return
-
+        # Values are re-resolved from the FutureMap bufs when future_indices
+        # is set, but row counts must still track the batch composition:
+        # consumers such as post_forward_mlp_sync_batch read spec_info row
+        # counts as the batch's real token count.
         self.topk_p = self.topk_p[new_indices]
         self.topk_index = self.topk_index[new_indices]
         self.bonus_tokens = self.bonus_tokens[new_indices]
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
+        if self.future_indices is not None:
+            self.future_indices = self.future_indices[new_indices]
+            return
         if self.pending_draft_tokens is not None:
             self.pending_draft_tokens = self.pending_draft_tokens[new_indices]
 
@@ -297,13 +300,7 @@ class DFlashDraftInputV2(SpecInput):
             self.nxt_kv_lens_cpu = spec_info.nxt_kv_lens_cpu
             self.nxt_kv_lens_sum = spec_info.nxt_kv_lens_sum
 
-        if self.future_indices is not None:
-            assert spec_info.future_indices is not None
-            self.future_indices = torch.cat(
-                [self.future_indices, spec_info.future_indices]
-            )
-            return
-
+        # Same row-count invariant as filter_batch above.
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
         self.bonus_tokens = torch.cat(
@@ -315,6 +312,13 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = torch.cat(
+                [self.future_indices, spec_info.future_indices]
+            )
+            return
+
         mask_token_id = (
             self.mask_token_id if self.mask_token_id is not None
             else spec_info.mask_token_id

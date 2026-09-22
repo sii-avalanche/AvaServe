@@ -208,6 +208,11 @@ def capture_cuda_graphs(
 
     if (
         model_runner.device == "cuda"
+        # Draft runners (e.g. DSpark's last-PP-stage draft) capture graphs on
+        # only a subset of the world ranks, so the world-group collective
+        # inside get_available_gpu_memory would deadlock against the other
+        # ranks' next collective. The budget lazy-inits locally when needed.
+        and not model_runner.is_draft_worker
         and envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() == "auto"
         and uses_deep_gemm_moe_runner
     ):

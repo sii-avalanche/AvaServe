@@ -506,6 +506,24 @@ def is_nemotron_35_draft_config(config: Any) -> bool:
     return sample_from_anchor is False
 
 
+def is_speculators_draft_config(config: Any) -> bool:
+    """Identify DFlash/DSpark draft checkpoints published by the speculators
+    library (vLLM convention).
+
+    These checkpoints differ from sglang-native drafts in the aux hidden-state
+    contract: their ``aux_hidden_state_layer_ids`` follow the vLLM layer-input
+    convention (id k names the hidden stream ENTERING layer k, i.e. the output
+    of layer k-1, with num_layers meaning the final hidden state), and they are
+    trained on the plain residual stream rather than the attn-res scored
+    aggregate sglang captures for native drafts.
+    """
+    if _cfg_get(config, "speculators_model_type", None) is not None:
+        return True
+    if _cfg_get(config, "speculators_config", None) is not None:
+        return True
+    return _cfg_get(config, "aux_hidden_state_layer_ids", None) is not None
+
+
 def _parse_optional_int(
     value: Any,
     *,
@@ -655,6 +673,12 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
+    if layer_ids is None and is_speculators_draft_config(draft_hf_config):
+        # Speculators checkpoints carry their aux layers as the top-level
+        # aux_hidden_state_layer_ids (vLLM layer-input convention). Map them
+        # so DFLASH consumers (e.g. the draft fc feature count) see the real
+        # ids; the vLLM->sglang id shift happens at aux-config resolution.
+        layer_ids = _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None)
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:
         parsed_target_layer_ids = None

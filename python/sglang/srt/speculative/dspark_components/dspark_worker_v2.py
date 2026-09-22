@@ -45,6 +45,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     draft_is_deepseek_v4,
     dspark_draft_own_embed_tokens_scope,
     get_dspark_sample_from_anchor,
+    read_draft_hf_config,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -222,27 +223,33 @@ class DSparkWorkerV2(BaseSpecWorker):
                     attention_backend_override=(
                         DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                     ),
+                    pp_active=needs_own_embed_tokens,
                     draft_worker_cls=draft_worker_cls,
                     # A last-stage-only draft worker cannot enter the WORLD
                     # broadcast; reuse the target's already-broadcast seed.
                     random_seed=target_worker.random_seed,
                 )
-            if needs_own_embed_tokens and self.ps.tp_rank == 0:
-                logger.info(
-                    "DSpark draft loads its own embed_tokens: the target's "
-                    "embedding is on the first pipeline stage."
-                )
             self._draft_worker = bundle.draft_worker
             self.draft_model_runner = bundle.draft_model_runner
             self.draft_model = bundle.draft_model
             draft_hf_config = self.draft_model_runner.model_config.hf_config
+            if (
+                needs_own_embed_tokens
+                and self.ps.tp_rank == 0
+                and getattr(self.draft_model, "embed_tokens", None) is not None
+            ):
+                logger.info(
+                    "DSpark draft loads its own embed_tokens: the target's "
+                    "embedding is on the first pipeline stage."
+                )
         else:
             self._draft_worker = None
             self.draft_model_runner = None
             self.draft_model = None
-            # The bundled draft shares the target's checkpoint config, so the
-            # runtime knobs resolve without loading draft weights.
-            draft_hf_config = target_worker.model_runner.model_config.hf_config
+            # Resolve the runtime knobs from the draft checkpoint's own
+            # config (the target checkpoint itself when the draft is bundled)
+            # without loading draft weights on this rank.
+            draft_hf_config = read_draft_hf_config()
         self._draft_sampler = None
         # Per-microbatch stash of the proposal's corrected logits for the
         # sampling accept. Under PP several micro-batches interleave on this

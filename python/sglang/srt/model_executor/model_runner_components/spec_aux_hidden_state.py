@@ -198,6 +198,19 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
+            if dspark_draft_config.vllm_aux_convention:
+                # vLLM layer-input convention: aux id k names the hidden stream
+                # entering layer k (= the output of layer k-1). sglang captures
+                # layer outputs, so shift every id down by one. Id num_layers
+                # (the final hidden state) maps to the last layer's output.
+                target_layer_ids = [int(lid) - 1 for lid in target_layer_ids]
+                for lid in target_layer_ids:
+                    if lid < 0 or lid >= target_num_layers:
+                        raise ValueError(
+                            "DSpark speculators aux layer id out of range after "
+                            f"convention mapping: mapped ids={target_layer_ids}, "
+                            f"target_num_layers={target_num_layers}."
+                        )
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
