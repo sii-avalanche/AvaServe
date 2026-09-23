@@ -6,6 +6,7 @@ import triton
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -73,6 +74,62 @@ if TYPE_CHECKING:
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
+
+
+def dcp_compact_topk_slots(
+    slots: torch.Tensor, cache_seqlens: torch.Tensor, dcp_rank: int, dcp_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Owner-filter a page_size=1 top-k slot table for decode context parallel.
+
+    Under DCP the allocator hands out VIRTUAL slots; virtual slot ``v`` lives on
+    rank ``v % dcp_size`` at physical row ``v // dcp_size`` of that rank's MLA
+    KV pool (``memory_pool.MLATokenToKVPool`` write masking and
+    ``kernels/ops/kvcache/mla_buffer.py`` use the same map). The DSA index-K
+    cache is replicated in the virtual space, so every rank computes the same
+    virtual top-k set; this turns it into the rank-local physical subset. The
+    partial outputs are then combined exactly via the LSE merge
+    (``layers/dcp/comm.py``).
+
+    fa3's paged kernel cannot mask -1 entries: it reads
+    ``page_table[0:cache_seqlen]`` verbatim, and non-DCP runs never see a -1
+    inside that range (padding sits past ``cache_seqlen``) -- but an in-place
+    owner filter would scatter -1 through it, and the kernel would dereference
+    them. This compacts the owned entries to the front of each row (KV order
+    within a row is attention-invariant) and returns the per-row owned counts
+    to use as the cache seqlens, so the kernel reads exactly the owned
+    physical rows.
+
+    Returns new tensors; ``slots`` is left untouched because the virtual set is
+    reused by the following ``index_topk_freq - 1`` layers, whose replicated
+    index-K pool is addressed by untranslated virtual locs.
+    """
+    owned = (slots >= 0) & ((slots % dcp_size) == dcp_rank)
+    sentinel = torch.iinfo(slots.dtype).max
+    compacted = torch.where(owned, slots, sentinel).sort(dim=-1, stable=True).values
+    compacted = torch.where(
+        compacted == sentinel, slots.new_full((), -1), compacted // dcp_size
+    )
+    owned_lens = owned.sum(dim=-1, dtype=cache_seqlens.dtype)
+    return compacted, owned_lens
+
+
+def should_merge_dsa_dcp_lse(forward_mode: ForwardMode) -> bool:
+    """DCP LSE-merge phases for the DCP-capable DSA impl (fa3).
+
+    Unlike the dense-MLA DCP path, the DSA backend has no consumer for the
+    dense prefix gather (``all_gather_kv_cache_for_mla_extend``), and fa3
+    already treats every extend token as an independent decode row with its
+    own top-k slot set. So plain EXTEND joins decode and target-verify on
+    the owner-filtered, LSE-merged path. MIXED / draft-extend modes are
+    rejected at config time for DSA+DCP.
+    """
+    if not get_parallel().dcp_enabled:
+        return False
+    return (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode == ForwardMode.EXTEND
+    )
 
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:

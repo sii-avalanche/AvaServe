@@ -56,9 +56,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
+    dcp_compact_topk_slots,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
+    should_merge_dsa_dcp_lse,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
@@ -349,6 +351,26 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+
+        # WQ Hopper DCP: the target's MLA KV is striped by owner (virtual slot
+        # v lives on rank v % dcp_size at physical v // dcp_size) while the
+        # index-K cache stays replicated in the virtual loc space. The fused
+        # top-k therefore yields VIRTUAL slots on every rank; the target
+        # attention must owner-filter them before the sparse kernel reads the
+        # local physical pool. The draft pool is replicated and addressed by
+        # untranslated virtual locs (kv_cache_configurator.loc_space_scale),
+        # so the draft never owner-filters.
+        _parallel = get_parallel()
+        self.dcp_compact_topk: bool = (
+            _parallel.dcp_enabled and not model_runner.is_draft_worker
+        )
+        self.dcp_rank: int = _parallel.attn_dcp_rank
+        self.dcp_size: int = _parallel.attn_dcp_size
+        # The DCP-capable kernel (fa3's ``flash_attn_with_kvcache``) returns a
+        # natural-log LSE; the DCP merge (``dcp_a2a_lse_reduce`` /
+        # ``cp_lse_ag_out_rs_mla``) reads this to pick its exp base (see the
+        # server_args DSA+DCP validation for the supported composition).
+        self.dcp_lse_base_on_e: bool = self.dsa_decode_impl == "fa3"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -2153,19 +2175,14 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "fa3":
-            return self._forward_fa3(
+            return self._forward_fa3_dsa(
                 q_rope=q_rope,
-                kv_cache=kv_cache,
-                v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
-                page_table=page_table_1,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
-                cu_seqlens_q=metadata.dsa_cu_seqlens_q,
-                cu_seqlens_k=metadata.dsa_cu_seqlens_k,
-                max_seqlen_q=metadata.dsa_max_seqlen_q,
-                sm_scale=layer.scaling,
-                logit_cap=layer.logit_cap,
-                page_size=1,
+                kv_cache=kv_cache,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                page_table_1=page_table_1,
             )
         elif dsa_impl == "aiter":
             if q_rope is not None:
@@ -2322,19 +2339,14 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.dsa_decode_impl == "fa3":
-            return self._forward_fa3(
+            return self._forward_fa3_dsa(
                 q_rope=q_rope,
-                kv_cache=kv_cache,
-                v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
-                page_table=page_table_1,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
-                cu_seqlens_q=metadata.dsa_cu_seqlens_q,
-                cu_seqlens_k=metadata.dsa_cu_seqlens_k,
-                max_seqlen_q=metadata.dsa_max_seqlen_q,
-                sm_scale=layer.scaling,
-                logit_cap=layer.logit_cap,
-                page_size=1,
+                kv_cache=kv_cache,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                page_table_1=page_table_1,
             )
         elif self.dsa_decode_impl == "aiter":
             if q_all is None or not _is_hip:
@@ -2351,6 +2363,44 @@ class DeepseekSparseAttnBackend(
         else:
             assert False, f"Unsupported {self.dsa_decode_impl = }"
 
+    def _forward_fa3_dsa(
+        self,
+        q_rope: torch.Tensor,
+        q_nope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: DSAMetadata,
+        page_table_1: torch.Tensor,
+    ):
+        cache_seqlens = metadata.dsa_cache_seqlens_int32
+        cu_seqlens_k = metadata.dsa_cu_seqlens_k
+        if self.dcp_compact_topk:
+            # fa3's paged kernel cannot mask -1 entries: compact the owned
+            # slots to the row front and bound the read with the owned counts.
+            page_table_1, cache_seqlens = dcp_compact_topk_slots(
+                page_table_1,
+                metadata.dsa_cache_seqlens_int32,
+                self.dcp_rank,
+                self.dcp_size,
+            )
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
+        return self._forward_fa3(
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            v_head_dim=layer.v_head_dim,
+            q_nope=q_nope,
+            page_table=page_table_1,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=metadata.dsa_cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=metadata.dsa_max_seqlen_q,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            page_size=1,
+            return_lse=should_merge_dsa_dcp_lse(forward_batch.forward_mode),
+        )
+
     def _forward_fa3(
         self,
         q_rope: torch.Tensor,
@@ -2365,13 +2415,14 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         logit_cap: float,
         page_size: int,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
-        o = flash_attn_with_kvcache(
+        result = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
@@ -2384,10 +2435,26 @@ class DeepseekSparseAttnBackend(
             softmax_scale=sm_scale,
             causal=True,
             softcap=logit_cap,
-            return_softmax_lse=False,
-            num_splits=self.num_splits,
+            return_softmax_lse=return_lse,
+            # The DCP merge consumes this LSE across ranks; the auto-split
+            # path's combined LSE is not trustworthy for the merge, so force
+            # a single split when the LSE is requested.
+            num_splits=1 if return_lse else self.num_splits,
         )
-        return o  # type: ignore
+        if return_lse:
+            # The wrapper returns (out, softmax_lse, *rest) with rest
+            # non-empty at runtime; unpack positionally. With cu_seqlens_q
+            # set (the varlen path, the only one used here) the kernel
+            # contract is softmax_lse == (nheads, total_q) in natural log,
+            # so transpose UNCONDITIONALLY to the [rows, heads] layout the
+            # DCP merge (dcp_a2a_lse_reduce / cp_lse_ag_out_rs_mla) expects
+            # -- a shape-based guess would silently skip the transpose when
+            # total_q == nheads. The merge all-gathers the LSE and the
+            # collective requires a contiguous input, which the transpose
+            # is not.
+            o, lse = result[0], result[1]
+            return o, lse.transpose(0, 1).contiguous()
+        return result  # type: ignore
 
     def _forward_flashmla_sparse(
         self,
@@ -3339,6 +3406,11 @@ class DeepseekSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
                 and (self.hisparse_coordinator is None)
+                # WQ Hopper DCP: MHA one-shot materializes the prefix K/V
+                # straight from the pool, which is owner-striped under DCP;
+                # only the absorbed (top-k, owner-filtered, LSE-merged) path
+                # is DCP-correct. Short prefills stay on the absorbed path.
+                and (not get_parallel().dcp_enabled)
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
