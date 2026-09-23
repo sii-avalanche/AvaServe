@@ -822,6 +822,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                     batch, on_publish, draft_input, pp_proxy_tensors
                 )
         draft_tokens = pending
+        # Garbage token ids (uninitialized/stale proposal buffer slots, e.g.
+        # the draft sampler's torch.empty static output buffer rows a folded
+        # replay did not refresh) must not reach the target embedding, the
+        # draft-logits scatter in _aligned_draft_block, or the accept path:
+        # with dp-lm-head the embedding runs its tp_size==1 branch, which does
+        # no shard masking, so an out-of-range id triggers a device-side
+        # assert in F.embedding and kills every scheduler. Draft tokens are
+        # only hints -- wrong ones are rejected by the accept path -- so remap
+        # out-of-range ids to the mask token (never accepted), preserving
+        # verify semantics. (masked_fill returns a new tensor; the aliased
+        # proposal buffer is left untouched.)
+        draft_tokens = draft_tokens.masked_fill(
+            (draft_tokens < 0) | (draft_tokens >= self._target_vocab_size),
+            int(self._mask_token_id),
+        )
 
         verify_window = alloc_verify_window(
             batch=batch,
@@ -834,6 +849,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_ids_2d = torch.cat(
             [draft_input.bonus_tokens.view(bs, 1), draft_tokens], dim=1
         ).contiguous()
+        # Garbage token ids (uninitialized/stale proposal buffer slots, e.g.
+        # the draft sampler's torch.empty static output buffer rows a folded
+        # replay did not refresh) must never reach the target embedding: with
+        # dp-lm-head the embedding runs its tp_size==1 branch, which does no
+        # shard masking, so an out-of-range id triggers a device-side assert
+        # in F.embedding and kills every scheduler. Draft tokens are only
+        # hints -- wrong ones are rejected by the accept path -- so remap
+        # out-of-range ids to the mask token (never accepted), preserving
+        # verify semantics.
+        verify_ids_2d = verify_ids_2d.masked_fill(
+            (verify_ids_2d < 0) | (verify_ids_2d >= self._target_vocab_size),
+            int(self._mask_token_id),
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (

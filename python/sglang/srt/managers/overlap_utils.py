@@ -380,6 +380,9 @@ class FutureMap:
                 dtype=pending0.dtype,
                 device=self.device,
             )
+            self.pending_draft_tokens_published = torch.zeros(
+                (self.req_pool_size,), dtype=torch.bool, device=self.device
+            )
 
     def _maybe_init_dsa_topk_indices_buf(self, payload: RelayPayload) -> None:
         if self.dsa_topk_indices_buf is not None or payload.dsa_topk_indices is None:
@@ -473,9 +476,28 @@ class FutureMap:
             self.pending_draft_tokens_buf is not None
             and getattr(draft_input, "pending_draft_tokens", None) is not None
         ):
-            draft_input.pending_draft_tokens = self.pending_draft_tokens_buf[
-                indices
-            ]
+            # Overwrite only rows whose slot was actually published. A request
+            # fresh from prefill carries pending=None in the relay (the stash
+            # skips None payloads), so its buf slot still holds torch.empty
+            # garbage; merge_batch already padded such rows with the safe mask
+            # token, and clobbering that padding with the unpublished slot
+            # content fed garbage ids into the target embedding (device-side
+            # assert on the tp_size==1 dp-lm-head branch).
+            buf_rows = self.pending_draft_tokens_buf[indices]
+            published = self.pending_draft_tokens_published[indices]
+            mask_id = getattr(draft_input, "mask_token_id", None)
+            if mask_id is not None:
+                # The gather shapes the output by indices (current batch
+                # composition), which can differ from the incoming pending
+                # row count; fill unpublished rows with the mask token
+                # (never accepted), the same value merge_batch pads with.
+                draft_input.pending_draft_tokens = torch.where(
+                    published.unsqueeze(1),
+                    buf_rows,
+                    torch.full_like(buf_rows, int(mask_id)),
+                )
+            else:
+                draft_input.pending_draft_tokens = buf_rows
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -647,6 +669,7 @@ class FutureMap:
             and payload.pending_draft_tokens is not None
         ):
             self.pending_draft_tokens_buf[indices] = payload.pending_draft_tokens
+            self.pending_draft_tokens_published[indices] = True
         if (
             self.dsa_topk_indices_buf is not None
             and payload.dsa_topk_indices is not None
