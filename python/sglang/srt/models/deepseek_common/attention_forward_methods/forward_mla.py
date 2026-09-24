@@ -299,6 +299,26 @@ class DeepseekMLAForwardMixin:
             return None
         return backend
 
+    def _q_replicate_project(self: DeepseekV2AttentionMLA, x: torch.Tensor):
+        """Full-head Q projection from the pre-gathered replicate weight.
+
+        Mirrors the sharded path's numerics: a plain dense GEMM for
+        unquantized weights, the layer's own w8a8 block-fp8 linear (same
+        backend, same block size) for fp8 block-quant weights.
+        """
+        if self.q_b_proj_qrep_weight.dtype == torch.float8_e4m3fn:
+            qp = self.q_b_proj if self.has_q_b_proj else self.q_proj
+            qm = qp.quant_method
+            return qm.w8a8_block_fp8_linear(
+                input=x,
+                weight=self.q_b_proj_qrep_weight,
+                block_size=qm.weight_block_size,
+                weight_scale=self.q_b_proj_qrep_weight_scale,
+                input_scale=None,
+                bias=None,
+            )
+        return torch.nn.functional.linear(x, self.q_b_proj_qrep_weight)
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -320,13 +340,15 @@ class DeepseekMLAForwardMixin:
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
-        # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
+        # weights and skip the per-layer Q all-gather. The full-head absorb
+        # bmm always runs (fa3 consumes the absorbed q_nope_out as qv), so the
+        # gathered w_kc is required in every case.
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
             and is_dcp_lse_merge_phase(forward_batch, self.use_dsa)
             and not self.use_deep_gemm_bmm
-            and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
+            and self.w_kc_qrep is not None
         )
         if q_replicate_active:
             # force standard absorb so the full-head w_kc bmm runs
@@ -397,7 +419,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
+                    q = self._q_replicate_project(q).view(
                         -1,
                         self.num_local_heads * get_parallel().attn_dcp_size,
                         self.qk_head_dim,
@@ -467,9 +489,7 @@ class DeepseekMLAForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
+                q = self._q_replicate_project(hidden_states).view(
                     -1,
                     self.num_local_heads * get_parallel().attn_dcp_size,
                     self.qk_head_dim,
@@ -496,11 +516,15 @@ class DeepseekMLAForwardMixin:
                 forward_batch, llama_4_scaling
             )
         if q_replicate_active:
-            # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
-            q_nope_out = (
-                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
-                .transpose(0, 1)
-                .contiguous()
+            # Full-head absorb with the pre-gathered w_kc (q_nope already
+            # full-head). The inline transpose is required: the shared
+            # trailing transpose lives inside the final ``else`` below, which
+            # this branch skips, so it must produce [T, H, V] itself. No
+            # contiguous(): the transpose view carries the same stride
+            # pattern the Q all-gather hands the attention backend in the
+            # non-replicate path (last-dim-contiguous strided qv).
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep).transpose(
+                0, 1
             )
         elif getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf

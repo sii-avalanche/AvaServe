@@ -133,9 +133,12 @@ def cp_lse_ag_out_rs_mla(
 
     with use_symmetric_memory(cp_group):
         # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
-        new_output = cp_attn_out.new_empty(
-            cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
-        )
+        # Merge in the attention output's own dtype: the backend already
+        # returns bf16 partials, so an fp32 staging buffer + fp32 reduce would
+        # only preserve precision that was already lost, while doubling the
+        # reduce-scatter traffic. The LSE stays fp32: it is tiny, and the
+        # log-domain math is the precision-sensitive part.
+        new_output = cp_attn_out.new_empty(cp_attn_out.transpose(0, 1).shape)
         cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
@@ -146,8 +149,7 @@ def cp_lse_ag_out_rs_mla(
         new_output,
         is_lse_base_on_e=is_lse_base_on_e,
     )
-    out = cp_group.reduce_scatter_along_dim(out, dim=0)
-    return out.to(cp_attn_out.dtype)
+    return cp_group.reduce_scatter_along_dim(out, dim=0)
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):

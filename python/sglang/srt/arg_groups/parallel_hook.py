@@ -148,15 +148,8 @@ def handle_dcp_validation(server_args: Any):
             "authoritative fabric probe runs at model-runner init; use 'a2a' "
             "or 'ag_rs' on clusters without MNNVL."
         )
-    if cfg.dcp_replicate_q_proj:
-        if cfg.dcp_size <= 1:
-            raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a"):
-            raise ValueError(
-                "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
-                "communication backend (it removes the head-dim Q all-gather); "
-                f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
-            )
+    if cfg.dcp_replicate_q_proj and cfg.dcp_size <= 1:
+        raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
 
 
 def handle_data_parallelism(server_args: Any):

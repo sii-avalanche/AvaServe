@@ -1043,8 +1043,11 @@ class ModelRunner:
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
-        # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
-        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        # q_b_proj into a full-head buffer once here (pre-capture) so the MLA
+        # decode path can skip the per-layer Q all-gather. Two weight formats:
+        # unquantized bf16/fp16 (dense GEMM) and block-quant fp8 e4m3
+        # (deep_gemm); both gather w_kc for the full-head absorb bmm.
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -1055,26 +1058,57 @@ class ModelRunner:
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA):
                 continue
-            if m.w_kc is None:
-                continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            # q-replicate only supports the unquantized bf16/fp16 absorb path;
-            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
-            # per-layer Q all-gather.
-            if (
-                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
-                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
-                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
+            if isinstance(qp.quant_method, UnquantizedLinearMethod):
+                if (
+                    m.w_kc is None
+                    or m.w_kc.dtype not in (torch.bfloat16, torch.float16)
+                    or qp.weight.dtype not in (torch.bfloat16, torch.float16)
+                ):
+                    logger.warning(
+                        "dcp_replicate_q_proj: skipping q-proj with non-bf16/fp16 "
+                        "weights; this layer keeps the Q all-gather."
+                    )
+                    continue
+                m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(
+                    qp.weight.data.contiguous(), dim=0
+                )
+            elif (
+                isinstance(qp.quant_method, Fp8LinearMethod)
+                and qp.quant_method.block_quant
+                and not qp.quant_method.use_mxfp8
+                and qp.weight.dtype == torch.float8_e4m3fn
             ):
+                # Block-quant fp8: the shard boundary is block-aligned, so
+                # gathering weight + block scales along dim 0 reconstructs the
+                # checkpoint's full-weight layout. The full-head absorb bmm
+                # still consumes w_kc (fa3 reads the absorbed q_nope_out as
+                # qv), so it is gathered like in the bf16 branch; fp8
+                # checkpoints dequantize kv_b to bf16 at load time.
+                if m.w_kc is None or m.w_kc.dtype not in (
+                    torch.bfloat16,
+                    torch.float16,
+                ):
+                    logger.warning(
+                        "dcp_replicate_q_proj: skipping fp8 q-proj with "
+                        "non-bf16/fp16 w_kc; this layer keeps the Q all-gather."
+                    )
+                    continue
+                m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(
+                    qp.weight.data.contiguous(), dim=0
+                )
+                m.q_b_proj_qrep_weight_scale = dcp_group.all_gather(
+                    qp.weight_scale_inv.data.contiguous(), dim=0
+                )
+            else:
                 logger.warning(
-                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
-                    "(bf16/fp16 only); this layer keeps the Q all-gather."
+                    "dcp_replicate_q_proj: unsupported q-proj quantization "
+                    "(bf16/fp16 and block-quant fp8 only); this layer keeps "
+                    "the Q all-gather."
                 )
                 continue
-            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
-            m.q_b_proj_qrep_weight = dcp_group.all_gather(
-                qp.weight.data.contiguous(), dim=0
-            )
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",

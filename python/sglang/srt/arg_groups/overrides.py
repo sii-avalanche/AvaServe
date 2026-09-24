@@ -1923,8 +1923,8 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
       HiSparse, and no speculative decoding yet;
     * no prefill CP, no mixed chunk (DSA EXTEND rides the decode LSE-merge
       path, which assumes pure EXTEND batches), no PD disaggregation;
-    * gathered Q (``--no-dcp-replicate-q-proj``: the fp8 q_b_proj has no
-      replicated-weight path).
+    * Q all-gathered per layer, or a replicated Q projection via
+      --dcp-replicate-q-proj (bf16 dense GEMM or fp8 block-quant deep_gemm).
     """
     if view.dcp_size <= 1:
         return {}
@@ -1984,11 +1984,6 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
         )
     if view.disaggregation_mode != "null":
         problems.append("PD disaggregation is not supported with DSA + DCP")
-    if view.dcp_replicate_q_proj:
-        problems.append(
-            "--dcp-replicate-q-proj (fp8 q_b_proj has no replicated-weight "
-            "path; use --no-dcp-replicate-q-proj)"
-        )
     if view.page_size != 64:
         problems.append(f"page_size={view.page_size} (DSA + DCP is validated with page_size=64)")
     if problems:

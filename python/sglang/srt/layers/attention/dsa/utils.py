@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode
@@ -99,18 +100,61 @@ def dcp_compact_topk_slots(
     to use as the cache seqlens, so the kernel reads exactly the owned
     physical rows.
 
+    Implemented as one fused Triton kernel: a single pass loads each row,
+    keeps the owned entries in row order (an owned entry's target column is
+    its rank among the row's owned entries, i.e. a cumsum), and pads the
+    tail with -1. This replaces the earlier multi-pass torch composition
+    (elementwise chain + radix sort), which launched ~10 kernels and made
+    several full passes over the table.
+
     Returns new tensors; ``slots`` is left untouched because the virtual set is
     reused by the following ``index_topk_freq - 1`` layers, whose replicated
     index-K pool is addressed by untranslated virtual locs.
     """
-    owned = (slots >= 0) & ((slots % dcp_size) == dcp_rank)
-    sentinel = torch.iinfo(slots.dtype).max
-    compacted = torch.where(owned, slots, sentinel).sort(dim=-1, stable=True).values
-    compacted = torch.where(
-        compacted == sentinel, slots.new_full((), -1), compacted // dcp_size
+    if dcp_size <= 1:
+        return slots, cache_seqlens
+    num_rows, topk = slots.shape
+    compacted = torch.empty_like(slots)
+    owned_lens = torch.empty(num_rows, dtype=torch.int32, device=slots.device)
+    _dcp_compact_topk_kernel[(num_rows,)](
+        slots,
+        compacted,
+        owned_lens,
+        topk,
+        dcp_rank,
+        dcp_size,
+        BLOCK=triton.next_power_of_2(topk),
     )
-    owned_lens = owned.sum(dim=-1, dtype=cache_seqlens.dtype)
-    return compacted, owned_lens
+    return compacted, owned_lens.to(cache_seqlens.dtype)
+
+
+@triton.jit
+def _dcp_compact_topk_kernel(
+    slots_ptr,
+    out_ptr,
+    lens_ptr,
+    topk: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    dcp_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    slots = tl.load(slots_ptr + row * topk + offs, mask=offs < topk, other=-1)
+    owned = (slots >= 0) & ((slots % dcp_size) == dcp_rank)
+    # An owned entry's target column is its rank among the row's owned
+    # entries; owned target columns are unique, so the scatter store cannot
+    # race. The padding store covers only the tail past owned_len, which is
+    # disjoint from the owned columns.
+    pos = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    owned_len = tl.sum(owned.to(tl.int32), axis=0)
+    tl.store(out_ptr + row * topk + pos, slots // dcp_size, mask=owned)
+    tl.store(
+        out_ptr + row * topk + offs,
+        tl.full([BLOCK], -1, tl.int32),
+        mask=offs >= owned_len,
+    )
+    tl.store(lens_ptr + row, owned_len)
 
 
 def should_merge_dsa_dcp_lse(forward_mode: ForwardMode) -> bool:
