@@ -15,7 +15,7 @@ sglang serve \
     --ep-size 4 \
     --pp-size 4 \
     --dcp-size 4 \
-    --no-dcp-replicate-q-proj \
+    --dcp-replicate-q-proj \
     --dsa-prefill-backend fa3 \
     --dsa-decode-backend fa3 \
     --moe-runner-backend deep_gemm \
@@ -32,7 +32,7 @@ sglang serve \
     --max-running-requests 256 \
     --disable-prefill-cuda-graph \
     --cuda-graph-max-bs-decode 66 \
-    --mem-fraction-static 0.90 \
+    --mem-fraction-static 0.88 \
     --enable-metrics \
     --enable-cache-report \
     --enable-hierarchical-cache \
