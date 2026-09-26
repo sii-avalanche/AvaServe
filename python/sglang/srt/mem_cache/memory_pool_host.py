@@ -56,6 +56,11 @@ class LogicalHostPool:
     compressed side pools use these logical FULL indices as stable page anchors.
     """
 
+    # Interface parity with pool_host/base.py: the logical anchor tracks
+    # logical FULL indices, so DCP never splits it across ranks.
+    dcp_size = 1
+    dcp_rank = 0
+
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
             raise ValueError(
