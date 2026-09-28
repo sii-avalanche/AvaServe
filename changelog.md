@@ -48,3 +48,4 @@ This fork adds the following features, optimizations and fixes relative to the o
 - Fix logprobs crash on the spec plain-decode fallback: wrap scalar next_token_logprobs into the per-request list layout spec verify batches use
 - Fix JIT modules failing to link -lcuda in GPU pods: add the injected driver lib dir /usr/local/nvidia/lib64 to the JIT link search path
 - Fix PP KV budget: profile each rank's own free memory when pp_size > 1 (the world-MIN on token capacity already guarantees a globally fitting pool) instead of charging every rank the worst rank's budget, and charge the DFLASH draft cell only on the last PP stage that physically hosts the draft pool
+- Fix --chat-template being silently ignored for models with architecture/tool-parser-based custom chat encoders (dsv4, dsv32, kimi_k3, inkling): an explicit --chat-template now opts into the Jinja chat-template path, taking precedence over the custom encoders
