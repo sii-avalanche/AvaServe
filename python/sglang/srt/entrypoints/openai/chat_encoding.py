@@ -110,12 +110,18 @@ def resolve_chat_encoding_spec(
     hf_config: Any,
     tokenizer: Any,
     tool_call_parser: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ) -> Optional[str]:
     """Return the chat encoding spec for a model.
 
     None means the default path (HF chat template); any non-None spec also owns
     reasoning-history rendering (:func:`spec_owns_reasoning_history`).
     """
+    # An explicit --chat-template opts into the Jinja chat-template path;
+    # the architecture-based custom encoders below would otherwise silently
+    # bypass it.
+    if chat_template is not None:
+        return None
     if tool_call_parser == "deepseekv4":
         return "dsv4"
     if tool_call_parser == "deepseekv32":
