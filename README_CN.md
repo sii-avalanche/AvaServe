@@ -4,7 +4,7 @@
 
 **高性能 LLM 服务部署**
 
-- 优化 [Kimi K3](deployment/Kimi-K3)、[DeepSeek V4 Pro](deployment/DSV4-Pro)、[GLM-5.3 FP8](deployment/GLM5-FP8) 等模型
+- 优化 [Kimi K3](deployment/Kimi-K3)、[DeepSeek V4 Pro](deployment/DSV4-Pro)、[GLM-5.3 FP8](deployment/GLM5-FP8)、[Nex N2.5 Max](deployment/Nex-N2.5-Max) 等模型
 - 优化 Hopper GPU 上的 LLM 推理吞吐
 - 优化 Hopper GPU 上的混合精度（FP4/FP8）推理
 - 优化 PP/TP/DP 与 HiCache 性能
@@ -23,7 +23,7 @@
   cd AvaServe/python
   pip install . --no-build-isolation
   pip install nvidia-nccl-cu13==2.30.7  # 升级 nccl 到 2.30.7
-  pip install mooncake-transfer-engine
+  pip install mooncake-transfer-engine-cuda13
 
   # 安装 sglang router
   pip install maturin
@@ -58,4 +58,4 @@
 
 **变更**
 
-详见[我们的变更](log.md)
+详见[我们的变更](changelog.md)
