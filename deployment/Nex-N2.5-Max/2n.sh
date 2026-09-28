@@ -8,8 +8,9 @@ SGLANG_PP_LAYER_PARTITION="16,15,15,15" \
 sglang serve \
     --model-path ${NEX_N25_MAX_MODEL_PATH} \
     --served-model-name nex-n2.5-max \
-    --reasoning-parser auto \
-    --tool-call-parser auto \
+    --reasoning-parser deepseek-r1 \
+    --tool-call-parser qwen3_coder \
+    --chat-template ${NEX_N25_MAX_MODEL_PATH}/chat_template.jinja \
     --trust-remote-code \
     --tp-size 4 \
     --ep-size 4 \
@@ -26,6 +27,7 @@ sglang serve \
     --port ${SGLANG_SERVER_PORT} \
     --watchdog-timeout 3600 \
     --dist-timeout 3600 \
+    --context-length 262144 \
     --chunked-prefill-size 8192 \
     --max-running-requests 128 \
     --disable-prefill-cuda-graph \

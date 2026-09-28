@@ -405,6 +405,7 @@ class OpenAIServingChat(OpenAIServingBase):
             hf_config=self.tokenizer_manager.model_config.hf_config,
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
+            chat_template=self.tokenizer_manager.server_args.chat_template,
         )
 
     def _request_id_prefix(self) -> str:
