@@ -94,6 +94,9 @@ padding_size = get_moe_padding_size(_use_aiter)
 
 logger = logging.getLogger(__name__)
 
+# Max token count (M) for which enable_fused_moe_sum_all_reduce takes effect.
+FUSED_MOE_SUM_ALL_REDUCE_MAX_TOKENS = 2048
+
 
 def _validate_fused_swiglu_interleaved(
     *,
@@ -582,12 +585,17 @@ def _fused_moe_kernel_sequence(
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 
+    # The atomic-add topk reduction only pays off at small M (decode): it
+    # trades topk*M*N atomic RMW traffic for the moe_sum_reduce kernel and its
+    # intermediate buffer round-trip, and atomics lose badly at large M
+    # (prefill). Gate it to the small-M regime.
     use_fused_moe_sum_all_reduce = (
         get_exec().moe.enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (hidden_states.shape[0] <= FUSED_MOE_SUM_ALL_REDUCE_MAX_TOKENS)
     )
 
     if fuse_swiglu_interleaved:
