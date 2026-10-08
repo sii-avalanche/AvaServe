@@ -360,6 +360,91 @@ def _fused_metadata_kernel_ps1_no_swa(
 
 
 @triton.jit
+def _fused_metadata_kernel_ps1_dcp(
+    # Input tensors
+    seq_lens,
+    seq_lens_stride_0,
+    req_to_token,
+    req_to_token_stride_0,
+    req_to_token_stride_1,
+    req_pool_indices,
+    req_pool_indices_stride_0,
+    # Output buffers
+    cache_seqlens_int32,
+    cache_seqlens_int32_stride_0,
+    cu_seqlens_k,
+    cu_seqlens_k_stride_0,
+    page_table,
+    page_table_stride_0,
+    page_table_stride_1,
+    # Scalar parameters
+    B,
+    max_seq_pages,
+    seq_len_delta: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """DCP variant of _fused_metadata_kernel_ps1_no_swa.
+
+    Owner rule: sequence position p lives on rank p % dcp_size at physical
+    slot loc // dcp_size, so the rank-local page table gathers this rank's
+    strided columns of req_to_token and divides by dcp_size. cache_seqlens
+    become the per-rank owned-token counts.
+    """
+    pid_b = tl.program_id(0)  # batch index
+    pid_c = tl.program_id(1)  # column chunk index
+
+    # 1. Prefix sums (only one block does them): local cache_seqlens + cu_seqlens_k.
+    if pid_b == 0 and pid_c == 0:
+        acc = 0
+        for idx in range(B):
+            seq = tl.load(seq_lens + idx * seq_lens_stride_0) + seq_len_delta
+            val = (seq // dcp_size + tl.where(dcp_rank < seq % dcp_size, 1, 0)).to(
+                tl.int32
+            )
+            tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, val)
+            tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc)
+            acc += val
+        tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
+
+    # 2. Gather for this batch and column chunk, self-guarded on the device-side
+    #    local seq_len (tails keep stale values the attention kernels never read
+    #    past cache_seqlens).
+    if max_seq_pages == 0:
+        return
+
+    i = pid_b
+    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32) + seq_len_delta
+    local_len = seq_len // dcp_size + tl.where(dcp_rank < seq_len % dcp_size, 1, 0)
+    num_live_pages = tl.minimum(local_len, max_seq_pages)
+    col_start = pid_c * BLOCK_COLS
+    if col_start >= num_live_pages:
+        return
+
+    row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
+    row_offset = row_idx * req_to_token_stride_0
+
+    col_offsets = col_start + tl.arange(0, BLOCK_COLS)
+    mask = col_offsets < num_live_pages
+    src_cols = dcp_rank + col_offsets * dcp_size
+    page_index = tl.load(
+        req_to_token + row_offset + src_cols * req_to_token_stride_1,
+        mask=mask,
+        other=0,
+        cache_modifier=".cg",
+    )
+
+    pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
+    tl.store(
+        page_table + pt_offsets,
+        page_index // dcp_size,
+        mask=mask,
+        cache_modifier=".cg",
+    )
+
+
+@triton.jit
 def _draft_extend_metadata_kernel(
     # Input tensors
     seq_lens,
@@ -583,6 +668,8 @@ def normal_decode_set_metadata(
     token_to_kv_pool: Optional["SWAKVPool"] = None,
     src_is_read_table: bool = False,
     swa_src_table: Optional[torch.Tensor] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
@@ -643,6 +730,44 @@ def normal_decode_set_metadata(
 
     # Check if we should use the specialized fast path for page_size=1, no SWA
     swa_uses_v2p = swa_v2p_page_table is not None
+
+    if dcp_size > 1:
+        # DCP: per-rank owner-rule (pos % dcp == rank) local lens and page
+        # table. Only the page_size == 1, no-SWA layout is implemented.
+        assert page_size == 1, "DCP decode metadata requires page_size == 1"
+        assert not use_swa, "DCP decode metadata does not support SWA"
+        assert not src_is_read_table, "DCP reads the raw req_to_token table"
+        BLOCK_COLS = 256
+        if max_seq_pages == 0:
+            grid = (1, 1)
+        else:
+            num_blocks_j = triton.cdiv(max_seq_pages, BLOCK_COLS)
+            grid = (batch_size, num_blocks_j)
+        _fused_metadata_kernel_ps1_dcp[grid](
+            seq_lens,
+            seq_lens_stride_0,
+            req_to_token,
+            req_to_token_stride_0,
+            req_to_token_stride_1,
+            req_pool_indices,
+            req_pool_indices_stride_0,
+            cache_seqlens_int32,
+            cache_seqlens_int32_stride_0,
+            cu_seqlens_k,
+            cu_seqlens_k_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            batch_size,
+            max_seq_pages,
+            seq_len_delta,
+            dcp_size,
+            dcp_rank,
+            BLOCK_COLS=BLOCK_COLS,
+            num_warps=8,
+            num_stages=3,
+        )
+        return
 
     if page_size == 1 and not use_swa:
         # Specialized kernel for the common case (page_size=1, no SWA)

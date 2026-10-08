@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
@@ -94,6 +98,9 @@ class FlashAttentionMetadata:
     swa_out_cache_loc: torch.Tensor = None
     # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
     scheduler_metadata: torch.Tensor = None
+    # DCP (decode context parallel): whether any request in an extend batch has
+    # a cached prefix on the rank-local shard (drives the LSE merge path).
+    dcp_has_prefix: bool = False
     # Per-forward-pass cache for the FA4 sheared-bias block schedule.
     # Created lazily by the first rel_bias layer; lives as long as this metadata
     # object, which for CUDA-graph captures keeps the buffers owned by the graph.
@@ -196,6 +203,14 @@ class FlashAttentionBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
         self._verify_mask = None
+        # Decode context parallel (DCP): the KV cache is sequence-sharded across
+        # the dcp_size ranks of each attention-TP group (owner rule
+        # pos % dcp_size == rank; physical slot = global_loc // dcp_size).
+        # Draft workers never join the DCP group (mirrors qwen3_5.py).
+        self.dcp_size = (
+            1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
+        )
+        self.dcp_rank = get_parallel().attn_dcp_rank
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -204,6 +219,33 @@ class FlashAttentionBackend(AttentionBackend):
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
+        if self.dcp_size > 1:
+            assert not self.use_mla, (
+                "DCP on the fa3/fa4 backend is implemented for MHA only; "
+                "MLA models have their own DCP-capable backends."
+            )
+            assert self.page_size == 1, (
+                "DCP on the fa3/fa4 backend requires page_size == 1, "
+                f"got page_size={self.page_size}."
+            )
+            assert not self.use_sliding_window_kv_pool, (
+                "DCP on the fa3/fa4 backend does not support the SWA KV pool."
+            )
+            assert not self.is_encoder_decoder, (
+                "DCP on the fa3/fa4 backend does not support cross attention."
+            )
+            assert self.attn_cp_size == 1, (
+                "DCP on the fa3/fa4 backend cannot be combined with prefill CP."
+            )
+            assert get_spec().speculative_algorithm is None, (
+                "Speculative decoding with --dcp-size > 1 is not supported on "
+                "the fa3/fa4 backend."
+            )
+            assert not self.kv_cache_is_mxfp8, (
+                "DCP on the fa3/fa4 backend does not support MXFP8 KV cache: "
+                "the masked KV write path has no FP4 variant."
+            )
 
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -240,6 +282,9 @@ class FlashAttentionBackend(AttentionBackend):
                 model_runner.attention_chunk_size is not None
             ), "Attention chunk size is required for local attention"
             self.attention_chunk_size = model_runner.attention_chunk_size
+        assert self.dcp_size == 1 or not self.has_local_attention, (
+            "DCP on the fa3/fa4 backend does not support local attention."
+        )
 
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
@@ -819,6 +864,28 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                if self.dcp_size > 1:
+                    # DCP: swap in the rank-local lens and page table (owner
+                    # rule pos % dcp == rank). cu_seqlens_q stays as-is.
+                    cache_seqlens = get_dcp_lens(
+                        seqlens_in_batch, self.dcp_size, self.dcp_rank
+                    ).to(torch.int32)
+                    metadata.cache_seqlens_int32 = cache_seqlens
+                    metadata.max_seq_len_k = (
+                        int(
+                            get_dcp_lens(
+                                seq_lens_cpu, self.dcp_size, self.dcp_rank
+                            ).max()
+                        )
+                        if seq_lens_cpu is not None
+                        else (eager_max_k + self.dcp_size - 1) // self.dcp_size
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    metadata.page_table = self._dcp_local_page_table(
+                        forward_batch.req_pool_indices, eager_max_k, device
+                    )
 
                 if self.is_prefill_aware_swa and self.has_swa:
                     pa_max_len = min(
@@ -1027,7 +1094,55 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if forward_batch.forward_mode.is_draft_extend_v2():
+            if self.dcp_size > 1:
+                # DCP: swap in the rank-local prefix lens and page table (owner
+                # rule pos % dcp == rank). cu_seqlens_q / max_seq_len_q from the
+                # branches above stay valid -- the new tokens are attended via
+                # raw K/V, only the cached prefix is sharded.
+                prefix_lens = forward_batch.extend_prefix_lens
+                assert prefix_lens is not None, (
+                    "DCP extend requires extend_prefix_lens on the forward batch"
+                )
+                local_prefix_lens = get_dcp_lens(
+                    prefix_lens, self.dcp_size, self.dcp_rank
+                )
+                metadata.cache_seqlens_int32 = local_prefix_lens.to(torch.int32)
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(local_prefix_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+                if forward_batch.extend_prefix_lens_cpu is not None:
+                    max_prefix_len = max(
+                        forward_batch.extend_prefix_lens_cpu, default=0
+                    )
+                    metadata.dcp_has_prefix = any(
+                        forward_batch.extend_prefix_lens_cpu
+                    )
+                    max_local_prefix = max(
+                        (
+                            p // self.dcp_size
+                            + (self.dcp_rank < p % self.dcp_size)
+                            for p in forward_batch.extend_prefix_lens_cpu
+                        ),
+                        default=0,
+                    )
+                else:
+                    max_prefix_len = int(prefix_lens.max().item())
+                    metadata.dcp_has_prefix = max_prefix_len > 0
+                    max_local_prefix = int(local_prefix_lens.max().item())
+                metadata.max_seq_len_k = max_local_prefix
+                metadata.page_table = self._dcp_local_page_table(
+                    forward_batch.req_pool_indices, max_prefix_len, device
+                )
+                extend_seq_lens = forward_batch.extend_seq_lens
+                metadata.max_seq_len_q = (
+                    max(forward_batch.extend_seq_lens_cpu)
+                    if forward_batch.extend_seq_lens_cpu is not None
+                    else int(extend_seq_lens.max().item())
+                )
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 # Fixed-q window (num_draft_tokens, widened by num_front_tokens
                 # when the CPU mirror is published); extend_seq_lens_cpu may be
                 # None on the GPU-only spec path, where the config constant is
@@ -1136,7 +1251,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
         # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1 and not _unified_read:
+        if self.page_size > 1 and not _unified_read and self.dcp_size == 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -1189,6 +1304,75 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
         self.forward_metadata = metadata
+
+    def _set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_scale,
+        v_scale,
+    ) -> None:
+        """KV write with the DCP owner rule when enabled: local slot =
+        global_loc // dcp_size, and only this rank's tokens are stored."""
+        if self.dcp_size > 1:
+            loc = cache_loc // self.dcp_size
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(loc, self.forward_metadata.swa_out_cache_loc),
+                k,
+                v,
+                k_scale,
+                v_scale,
+                dcp_kv_mask=self._dcp_kv_write_mask(forward_batch, loc),
+            )
+        else:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                k,
+                v,
+                k_scale,
+                v_scale,
+            )
+
+    def _dcp_local_page_table(
+        self,
+        req_pool_indices: torch.Tensor,
+        max_seq_len_k: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Rank-local page table under DCP.
+
+        Owner rule: sequence position p lives on rank p % dcp_size at physical
+        slot loc // dcp_size, so the rank-local table gathers this rank's
+        strided columns of the global table and divides by dcp_size. Row tails
+        past a request's owned length are never read (bounded by cache_seqlens).
+        """
+        # Clamp the range to >= 1 column: sequences shorter than dcp_rank own
+        # no token here (empty range would raise); the extra column is never
+        # read because cache_seqlens stays 0 for those rows.
+        cols = torch.arange(
+            self.dcp_rank,
+            max(max_seq_len_k, self.dcp_rank + self.dcp_size),
+            self.dcp_size,
+            device=device,
+        )
+        return (
+            self.req_to_token[req_pool_indices[:, None], cols[None, :]]
+            // self.dcp_size
+        ).to(torch.int32)
+
+    def _dcp_kv_write_mask(
+        self, forward_batch: ForwardBatch, loc: torch.Tensor
+    ) -> torch.Tensor:
+        """Owner-rule KV write mask (mirrors TritonAttnBackend._set_kv_buffer)."""
+        positions = forward_batch.positions
+        if positions is not None and positions.numel() == loc.numel():
+            return positions % self.dcp_size == self.dcp_rank
+        return forward_batch.dcp_kv_mask
 
     def get_paged_mha_kv_cache(
         self,
@@ -1327,13 +1511,8 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        k_scale,
-                        v_scale,
+                    self._set_kv_buffer(
+                        layer, forward_batch, cache_loc, k, v, k_scale, v_scale
                     )
 
         # Use precomputed metadata across all layers
@@ -1560,6 +1739,19 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     **kwargs,
+                )
+            elif self.dcp_size > 1:
+                result = self._forward_extend_dcp(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    metadata,
+                    key_cache,
+                    value_cache,
+                    kwargs,
+                    _fa_out,
                 )
             else:
                 result = flash_attn_with_kvcache(
@@ -1821,6 +2013,86 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _forward_extend_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        metadata: FlashAttentionMetadata,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        kwargs: dict,
+        fa_out: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """MHA extend under DCP (mirrors TritonAttnBackend._forward_extend_dcp).
+
+        The rank-local KV pool holds only this rank's owner-rule shard, so the
+        new (extend) tokens attend over the raw K/V tensors (varlen, causal),
+        while the cached prefix is attended on the local shard and merged
+        across the DCP group with the LSE correction.
+        """
+        group = get_parallel().dcp_group
+        has_prefix = metadata.dcp_has_prefix
+        current = self.flash_attn_varlen_func(
+            q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+            v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=metadata.cu_seqlens_q,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            causal=True,
+            return_softmax_lse=has_prefix,
+            num_splits=1 if has_prefix else self.num_splits,
+            out=fa_out,
+            ver=self.fa_impl_ver,
+            **kwargs,
+        )
+        if not has_prefix:
+            return current
+        current_out, current_lse, *rest = current
+        # The prefix KV is sharded across DCP ranks: attend to the local shard
+        # with the all-gathered query heads, then merge partials by LSE.
+        with use_symmetric_memory(group):
+            q_local = q.view(-1, layer.tp_q_head_num, layer.head_dim).contiguous()
+        q_all = group.all_gather(q_local, dim=1).contiguous()
+        prefix_out, prefix_lse, *rest = self.flash_attn_with_kvcache(
+            q=q_all,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            max_seqlen_q=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            causal=False,
+            return_softmax_lse=True,
+            num_splits=1,
+            ver=self.fa_impl_ver,
+            **kwargs,
+        )
+        # Rows with no owned prefix token on this rank must drop out of the
+        # cross-rank merge with a -inf LSE (owner rule; short cached prefixes).
+        zero_local = metadata.cache_seqlens_int32 == 0
+        prefix_out = prefix_out.masked_fill(zero_local[:, None, None], 0)
+        prefix_lse = prefix_lse.masked_fill(zero_local[None, :], -float("inf"))
+        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
+            prefix_out,
+            prefix_lse.transpose(0, 1).contiguous(),
+            group,
+            return_lse=True,
+        )
+        out, _ = merge_state_v2_wrapper(
+            prefix_out,
+            prefix_lse,
+            current_out,
+            current_lse.transpose(0, 1).contiguous(),
+        )
+        return out.to(q.dtype)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1854,13 +2126,8 @@ class FlashAttentionBackend(AttentionBackend):
                 if not self.use_mla:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
                     v_scale = v_descale if self.kv_cache_is_mxfp8 else layer.v_scale
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        k_scale,
-                        v_scale,
+                    self._set_kv_buffer(
+                        layer, forward_batch, cache_loc, k, v, k_scale, v_scale
                     )
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(
@@ -1990,6 +2257,47 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
                     **kwargs,
+                )
+            elif self.dcp_size > 1:
+                # DCP decode: all-gather the head shards, attend to the local
+                # KV shard, then merge partials across the DCP group by LSE
+                # (mirrors TritonAttnBackend's decode DCP path).
+                group = get_parallel().dcp_group
+                with use_symmetric_memory(group):
+                    q_local = q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    )
+                q_all = group.all_gather(q_local, dim=1).contiguous()
+                if self._decode_uses_static_max_seqlen_k:
+                    kwargs["max_seqlen_k"] = metadata.max_seq_len_k
+                result = flash_attn_with_kvcache(
+                    q=q_all,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=metadata.page_table,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    return_softmax_lse=True,
+                    num_splits=1,
+                    ver=self.fa_impl_ver,
+                    **kwargs,
+                )
+                o, softmax_lse, *rest = result
+                # A request may own no token on this rank (seq_len < dcp_size):
+                # force its empty partial to -inf LSE so the cross-rank merge
+                # drops it instead of polluting the output.
+                zero_local = metadata.cache_seqlens_int32 == 0
+                o = o.masked_fill(zero_local[:, None, None], 0)
+                softmax_lse = softmax_lse.masked_fill(
+                    zero_local[None, :], -float("inf")
+                )
+                o = cp_lse_ag_out_rs_mha(
+                    o, softmax_lse.transpose(0, 1).contiguous(), group
                 )
             else:
                 page_table = metadata.page_table
@@ -2853,7 +3161,36 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                if self.is_prefill_aware_swa:
+                if self.dcp_size > 1:
+                    # DCP: rank-local lens + compacted local page table, filled
+                    # on-device by the fused metadata kernel (no D2H sync).
+                    metadata.max_seq_len_k = (
+                        int(
+                            get_dcp_lens(
+                                seq_lens_cpu, self.dcp_size, self.dcp_rank
+                            ).max()
+                        )
+                        if seq_lens_cpu is not None
+                        else (self.max_context_len + self.dcp_size - 1)
+                        // self.dcp_size
+                    )
+                    normal_decode_set_metadata(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        self.max_num_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        None,
+                        src_is_read_table=False,
+                        dcp_size=self.dcp_size,
+                        dcp_rank=self.dcp_rank,
+                    )
+                elif self.is_prefill_aware_swa:
                     # Prefill-aware SWA still needs a host max to bound the
                     # per-batch page table built below.
                     max_len = self._host_max_seq_len(seq_lens_cpu, seq_lens)

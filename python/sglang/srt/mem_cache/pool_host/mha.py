@@ -83,6 +83,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
@@ -95,6 +97,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
             pool_label=pool_label,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
@@ -262,6 +266,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             host_layer_id = device_layer_id = layer_id
 
+        host_indices = self.maybe_dcp_kernel_indices(host_indices)
+        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -392,6 +399,8 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        host_indices = self.maybe_dcp_kernel_indices(host_indices)
+        device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if io_backend == "kernel_ascend":
             # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.
@@ -1177,6 +1186,9 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         else:
             host_layer_id = device_layer_id = layer_id
 
+        host_indices = self.maybe_dcp_kernel_indices(host_indices)
+        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(
@@ -1233,6 +1245,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        host_indices = self.maybe_dcp_kernel_indices(host_indices)
+        device_indices = self.maybe_dcp_kernel_indices(device_indices)
         (
             device_k_data_ptrs,
             device_v_data_ptrs,

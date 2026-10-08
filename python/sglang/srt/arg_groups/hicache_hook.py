@@ -9,7 +9,6 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
-    use_mla_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,12 +95,6 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         raise NotImplementedError(
             "--enable-hisparse with --dcp-size > 1 is not supported: the "
             "HiSparse host pool is constructed without DCP translation."
-        )
-    if not use_mla_backend(server_args):
-        raise NotImplementedError(
-            "HiCache with --dcp-size > 1 is only supported for MLA models: "
-            "the index translation lives in MLATokenToKVPoolHost, and the "
-            "MHA host pool has none."
         )
     logger.info(
         "HiCache + DCP enabled (L1/L2 only): host pool uses widened "

@@ -89,6 +89,7 @@ class HiRadixCache(RadixCache):
 
         allocator_type = get_allocator_type()
 
+        _parallel = get_parallel()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
@@ -97,6 +98,8 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 get_memory().hicache_mem_layout,
                 allocator_type=allocator_type,
+                dcp_size=_parallel.attn_dcp_size,
+                dcp_rank=_parallel.attn_dcp_rank,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -106,7 +109,6 @@ class HiRadixCache(RadixCache):
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
 
-            _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 get_memory().hicache_ratio,
