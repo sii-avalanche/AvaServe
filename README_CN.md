@@ -4,7 +4,12 @@
 
 **高性能 LLM 服务部署**
 
-- 优化 [Kimi K3](deployment/Kimi-K3)、[DeepSeek V4 Pro](deployment/DSV4-Pro)、[GLM-5.3 FP8](deployment/GLM5-FP8)、[Nex N2.5 Max](deployment/Nex-N2.5-Max) 等模型
+- 针对以下模型优化：
+  - [Kimi K3](deployment/Kimi-K3)
+  - [DeepSeek V4 Pro](deployment/DSV4-Pro)
+  - [GLM-5.3 FP8](deployment/GLM5-FP8)
+  - [Nex N2.5 Max](deployment/Nex-N2.5-Max)
+  - [Nex N2.5 Pro](deployment/Nex-N2.5-Pro)
 - 优化 Hopper GPU 上的 LLM 推理吞吐
 - 优化 Hopper GPU 上的混合精度（FP4/FP8）推理
 - 优化 PP/TP/DP 与 HiCache 性能

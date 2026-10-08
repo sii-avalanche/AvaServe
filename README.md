@@ -4,7 +4,12 @@ English | [简体中文](README_CN.md)
 
 **High performance LLM serving deployment**
 
-- Optimized for [Kimi K3](deployment/Kimi-K3), [DeepSeek V4 Pro](deployment/DSV4-Pro), [GLM-5.3 FP8](deployment/GLM5-FP8), [Nex N2.5 Max](deployment/Nex-N2.5-Max), … models
+- Optimized for the following models:
+  - [Kimi K3](deployment/Kimi-K3)
+  - [DeepSeek V4 Pro](deployment/DSV4-Pro)
+  - [GLM-5.3 FP8](deployment/GLM5-FP8)
+  - [Nex N2.5 Max](deployment/Nex-N2.5-Max)
+  - [Nex N2.5 Pro](deployment/Nex-N2.5-Pro)
 - Optimized for LLM inference throughput on Hopper GPUs
 - Optimized mixed precision (FP4/FP8) support on Hopper GPUs
 - Optimized PP/TP/DP and HiCache performance
