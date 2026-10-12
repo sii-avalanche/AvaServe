@@ -3732,6 +3732,17 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
+            running_batch.batch_is_full
+            and len(self.waiting_queue) > 0
+            and self.chunked_req is None
+            and self.get_num_allocatable_reqs(
+                len(running_batch.reqs), running_batch=running_batch
+            )
+            > 0
+        ):
+            running_batch.batch_is_full = False
+
+        if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None, running_batch
