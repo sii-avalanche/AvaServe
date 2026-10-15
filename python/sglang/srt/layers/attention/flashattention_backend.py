@@ -2076,9 +2076,31 @@ class FlashAttentionBackend(AttentionBackend):
         )
         # Rows with no owned prefix token on this rank must drop out of the
         # cross-rank merge with a -inf LSE (owner rule; short cached prefixes).
+        # cache_seqlens_int32 is per request; expand its mask to extend-token
+        # rows to match prefix_out [num_extend_tokens, ...] (output_size avoids
+        # the repeat_interleave stream sync). Rows beyond the batch's real
+        # tokens are padding (prepare_mlp_sync_batch pads the batch to a
+        # multiple of attn_tp_size for the attn_tp-dim collectives): they
+        # belong to no request and stay unmasked here; they are zeroed after
+        # the merge below.
+        num_real_tokens = (
+            sum(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.extend_seq_lens_cpu is not None
+            else int(metadata.cu_seqlens_q[-1].item())
+        )
         zero_local = metadata.cache_seqlens_int32 == 0
-        prefix_out = prefix_out.masked_fill(zero_local[:, None, None], 0)
-        prefix_lse = prefix_lse.masked_fill(zero_local[None, :], -float("inf"))
+        zero_local_tokens = zero_local.repeat_interleave(
+            metadata.cu_seqlens_q[1:] - metadata.cu_seqlens_q[:-1],
+            output_size=num_real_tokens,
+        )
+        if zero_local_tokens.shape[0] < prefix_out.shape[0]:
+            zero_local_tokens = torch.nn.functional.pad(
+                zero_local_tokens,
+                (0, prefix_out.shape[0] - zero_local_tokens.shape[0]),
+                value=False,
+            )
+        prefix_out = prefix_out.masked_fill(zero_local_tokens[:, None, None], 0)
+        prefix_lse = prefix_lse.masked_fill(zero_local_tokens[None, :], -float("inf"))
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out,
             prefix_lse.transpose(0, 1).contiguous(),
@@ -2091,6 +2113,12 @@ class FlashAttentionBackend(AttentionBackend):
             current_out,
             current_lse.transpose(0, 1).contiguous(),
         )
+        # The attention output rows beyond the batch's real tokens are padding:
+        # the varlen/kvcache kernels and the merge leave them uninitialized,
+        # and NaN/inf garbage there rides the residual stream and poisons later
+        # layers (fp8 scales, norms). Zero them deterministically.
+        if num_real_tokens < out.shape[0]:
+            out[num_real_tokens:] = 0
         return out.to(q.dtype)
 
     def forward_decode(
