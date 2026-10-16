@@ -12,7 +12,6 @@ sglang serve \
     --tool-call-parser glm47 \
     --trust-remote-code \
     --tp-size 4 --moe-dense-tp-size 1 \
-    --ep-size 4 \
     --pp-size 4 \
     --dcp-size 4 \
     --dcp-replicate-q-proj \
@@ -32,7 +31,7 @@ sglang serve \
     --max-running-requests 256 \
     --disable-prefill-cuda-graph \
     --cuda-graph-max-bs-decode 66 \
-    --mem-fraction-static 0.88 \
+    --mem-fraction-static 0.85 \
     --enable-metrics \
     --enable-cache-report \
     --enable-hierarchical-cache \
