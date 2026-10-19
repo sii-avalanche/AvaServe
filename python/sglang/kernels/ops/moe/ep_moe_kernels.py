@@ -1035,7 +1035,11 @@ def _fwd_kernel_ep_scatter_1(
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    # Take the segment start from the register cumsum instead of reading back
+    # expert_start_loc: a same-kernel load is not guaranteed to observe the
+    # cross-lane global store above (no barrier orders them), and a stale
+    # value turns the m_indices writes below into out-of-bounds stores.
+    cur_expert_start = tl.sum(tl.where(offset_cumsum == cur_expert, cumsum, 0), axis=0)
     cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
     cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
